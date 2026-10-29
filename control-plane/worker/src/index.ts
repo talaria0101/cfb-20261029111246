@@ -40,25 +40,25 @@ export default {
     }
 
     try {
-      // ────────────────────────────────────────────────────────────────────────
+      // ------------------------------------------------------------------------
       // 1. Topology & Infrastructure Graph (Homelable Pattern)
-      // ────────────────────────────────────────────────────────────────────────
+      // ------------------------------------------------------------------------
       if (url.pathname === "/api/topology" && request.method === "GET") {
         return await handleTopologyGraph(env);
       }
 
-      // ────────────────────────────────────────────────────────────────────────
+      // ------------------------------------------------------------------------
       // 2. Real-Time Telemetry Stream (from cfb-broker sysinfo probe)
-      // ────────────────────────────────────────────────────────────────────────
+      // ------------------------------------------------------------------------
       if (url.pathname === "/api/telemetry" && request.method === "GET") {
         return await fetch(`${env.BROKER_TUNNEL_HOST}/telemetry/sample`, {
           headers: getTunnelHeaders(env),
         });
       }
 
-      // ────────────────────────────────────────────────────────────────────────
+      // ------------------------------------------------------------------------
       // 3. Compute & Sandboxes (Proxied directly to cfb-broker)
-      // ────────────────────────────────────────────────────────────────────────
+      // ------------------------------------------------------------------------
       if (url.pathname === "/api/sandboxes/list" && request.method === "GET") {
         return await fetch(`${env.BROKER_TUNNEL_HOST}/docker/containers/json?all=1`, {
           headers: getTunnelHeaders(env),
@@ -121,9 +121,9 @@ export default {
         );
       }
 
-      // ────────────────────────────────────────────────────────────────────────
+      // ------------------------------------------------------------------------
       // 4. Storage Plane: Presigned URLs for cfb-broker S3 Engine
-      // ────────────────────────────────────────────────────────────────────────
+      // ------------------------------------------------------------------------
       if (url.pathname === "/api/storage/presign" && request.method === "POST") {
         const { bucket, key, operation, contentType } = await request.json<{
           bucket: string;
@@ -160,9 +160,9 @@ export default {
         return Response.json({ presignedUrl });
       }
 
-      // ────────────────────────────────────────────────────────────────────────
+      // ------------------------------------------------------------------------
       // 5. Heavy CI: Webhook Dispatch & Live SSE Log Proxy
-      // ────────────────────────────────────────────────────────────────────────
+      // ------------------------------------------------------------------------
       if (url.pathname === "/webhook/github" && request.method === "POST") {
         return await handleGitHubWebhook(request, env);
       }
@@ -197,9 +197,9 @@ export default {
         });
       }
 
-      // ────────────────────────────────────────────────────────────────────────
+      // ------------------------------------------------------------------------
       // 6. workerd Runtime & Durable Objects Gateway Proxy
-      // ────────────────────────────────────────────────────────────────────────
+      // ------------------------------------------------------------------------
       if (url.pathname.startsWith("/api/workerd/")) {
         const subPath = url.pathname.replace("/api/workerd", "");
         const targetUrl = new URL(subPath + url.search, `${env.BROKER_TUNNEL_HOST}/workerd`);

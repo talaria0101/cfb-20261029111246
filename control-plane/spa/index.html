@@ -188,7 +188,7 @@
   <header>
     <h1>Cloudflare Alt Control Plane <span class="badge">cfb-broker Unified</span></h1>
     <div style="font-size: 0.85rem; color: var(--text-muted);">
-      Daemon: <span style="color: var(--accent); font-weight: 600;">cfb-broker (<20MB Rust)</span> &bull; Tunnel: <span style="color: var(--success); font-weight: 600;">ACTIVE (QUIC / cfrs)</span>
+      Daemon: <span style="color: var(--accent); font-weight: 600;">cfb-broker (<20MB Rust)</span> * Tunnel: <span style="color: var(--success); font-weight: 600;">ACTIVE (QUIC / cfrs)</span>
     </div>
   </header>
 
@@ -262,10 +262,10 @@
         <div class="topo-layer">
           <div class="topo-node control">
             <div class="topo-node-title">Cloudflare Edge</div>
-            <div class="topo-node-meta">Pages SPA &bull; Worker API &bull; D1</div>
+            <div class="topo-node-meta">Pages SPA * Worker API * D1</div>
           </div>
         </div>
-        <div style="text-align: center; color: var(--accent);">&darr; Outbound Encrypted QUIC / HTTP3 &darr;</div>
+        <div style="text-align: center; color: var(--accent);">| Outbound Encrypted QUIC / HTTP3 |</div>
         <!-- Layer 2: Tunnel Ingress -->
         <div class="topo-layer">
           <div class="topo-node network">
@@ -273,15 +273,15 @@
             <div class="topo-node-meta">Zero open inbound ports</div>
           </div>
         </div>
-        <div style="text-align: center; color: #38bdf8;">&darr; Host Node (Single Daemon) &darr;</div>
+        <div style="text-align: center; color: #38bdf8;">| Host Node (Single Daemon) |</div>
         <!-- Layer 3: Unified Broker -->
         <div class="topo-layer">
           <div class="topo-node host" style="border-width: 2px;">
             <div class="topo-node-title">cfb-broker (Rust < 20MB)</div>
-            <div class="topo-node-meta">Tunnel &bull; S3 Engine &bull; CI Runner &bull; Telemetry &bull; Supervisor</div>
+            <div class="topo-node-meta">Tunnel * S3 Engine * CI Runner * Telemetry * Supervisor</div>
           </div>
         </div>
-        <div style="text-align: center; color: var(--success);">&darr; Subsystems &amp; Sandboxes &darr;</div>
+        <div style="text-align: center; color: var(--success);">| Subsystems &amp; Sandboxes |</div>
         <!-- Layer 4: Sandboxes & workerd -->
         <div class="topo-layer" id="topoSandboxes">
           <div class="topo-node service">

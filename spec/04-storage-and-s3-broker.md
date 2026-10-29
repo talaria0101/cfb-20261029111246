@@ -1,103 +1,74 @@
-# Storage Plane: Embedded S3 Broker & Drop-In R2 Compatibility
+# Storage Specification: Embedded S3 Broker & R2 Interface
 
-## 1. The R2 Drop-In Requirement
+## 1. Interface Scope
 
-Cloudflare R2 serves two access patterns:
-1. **In-Worker Bindings**: `await env.MY_BUCKET.put(key, stream)` and `await env.MY_BUCKET.get(key)`.
-2. **External S3 Clients**: Applications using `@aws-sdk/client-s3`, AWS CLI, Terraform, or rclone.
-
-To replace R2 without running heavy external object stores (like MinIO consuming 2–4 GiB RAM), **`cfb-broker` embeds a lightweight S3-compatible storage engine directly in Rust**.
+The storage subsystem inside `cfb-broker` provides dual-path object storage compatibility:
+1. In-Process R2 Binding: Serves internal `env.MY_BUCKET` calls from `workerd`.
+2. Standard S3 Protocol: Serves external S3 clients and AWS SDKs over the Cloudflare Tunnel hostname (`s3.infra.example.com`).
 
 ---
 
-## 2. Architecture of the Embedded S3 Broker
+## 2. Supported S3 Protocol Operations
 
+| Operation | HTTP Method & URI | Request Headers | Response |
+| :--- | :--- | :--- | :--- |
+| PutObject | `PUT /{bucket}/{key}` | `Content-Type`, `Content-Length`, `x-amz-meta-*` | HTTP 200 with `ETag` header |
+| GetObject | `GET /{bucket}/{key}` | Optional `Range: bytes=start-end` | HTTP 200/206 with object body |
+| HeadObject | `HEAD /{bucket}/{key}` | None | HTTP 200 with metadata headers |
+| DeleteObject | `DELETE /{bucket}/{key}` | None | HTTP 204 No Content |
+| ListObjectsV2 | `GET /{bucket}?list-type=2` | Optional `prefix`, `max-keys`, `continuation-token` | XML payload with key listings |
+
+---
+
+## 3. Storage Engine Mechanics
+
+### File Layout
 ```
-                                  PUBLIC CLIENTS / BROWSERS
-                                              │
-                     ┌────────────────────────┴────────────────────────┐
-                     │                                                 │
-            1. Request Presigned URL                          2. Direct Upload via S3
-                     │                                                 │
-                     ▼                                                 ▼
-       ┌───────────────────────────┐                     ┌───────────────────────────┐
-       │ Cloudflare Edge Worker    │                     │  Cloudflare Tunnel Ingress│
-       │ (Signs AWS SigV4 URL)     │                     │  (s3.infra.yourdomain.com)│
-       └───────────────────────────┘                     └─────────────┬─────────────┘
-                                                                       │
- ══════════════════════════════════════════════════════════════════════╪══════════════════════
-                               HOST SERVER (cfb-broker)                │
- ══════════════════════════════════════════════════════════════════════╪══════════════════════
-                                                                       ▼
-                                 ┌───────────────────────────────────────────────────────────┐
-                                 │ cfb-broker: Embedded S3 Engine                            │
-                                 │                                                           │
-                                 │ • Validates AWS SigV4 signatures (or bypasses via Access) │
-                                 │ • Streams object bodies directly to NVMe disk             │
-                                 │ • Atomic writes using temp files (.tmp-*) + rename        │
-                                 │ • Maintains metadata in SQLite: bucket, key, etag, size   │
-                                 └──────────────┬─────────────────────────────┬──────────────┘
-                                                │                             │
-                                                ▼                             ▼
-                          ┌───────────────────────────┐ ┌───────────────────────────┐
-                          │ Local Filesystem (NVMe)   │ │ workerd R2 Binding Bridge │
-                          │ /var/lib/cfb-broker/s3/   │ │ env.MY_BUCKET.get/put     │
-                          │   └── artifacts/          │ │ (Mapped directly to disk) │
-                          │       └── build-123.tar.gz│ │                           │
-                          └───────────────────────────┘ └───────────────────────────┘
+/var/lib/cfb-broker/s3-data/
+  \-- <bucket>/
+        |-- uploads/
+        |     \-- .tmp-<uuid>          (active atomic writes)
+        \-- <key>                      (committed object bytes)
 ```
 
----
-
-## 3. Supported S3 API Endpoints in `cfb-broker`
-
-The embedded S3 broker implements core S3 primitives:
-- `PUT /{bucket}/{key}`: Uploads object stream; computes MD5/SHA256 ETag; stores file atomically.
-- `GET /{bucket}/{key}`: Streams object with HTTP `Range` request support for resumable downloads.
-- `HEAD /{bucket}/{key}`: Returns `ETag`, `Content-Length`, `Content-Type`, and metadata headers.
-- `DELETE /{bucket}/{key}`: Removes file and metadata record.
-- `GET /{bucket}?list-type=2`: S3 ListObjectsV2 XML response supporting prefixes and pagination.
-
-### Zero-Memory Streaming
-Large multi-gigabyte ISOs or container tarballs are piped directly from the async HTTP request stream into local storage using `tokio::fs::File`, using a constant **64 KiB buffer**. Memory usage never increases regardless of object file size.
+### Streaming & Memory Bounds
+- Request bodies are read in chunked 64 KiB buffers using `tokio::io::copy` and written directly to disk.
+- Maximum resident memory used per concurrent upload stream: 64 KiB regardless of file size.
+- Atomic commit: uploads write to `.tmp-<uuid>` and execute an atomic `rename()` system call once the SHA-256 and MD5 hashes are validated.
 
 ---
 
-## 4. In-Worker R2 Binding: Zero Code Changes
+## 4. Presigned URL Protocol via Edge Worker
 
-Inside `workerd`, Cloudflare's C++ runtime translates `env.MY_BUCKET.put(key, body)` into an internal HTTP binding request. `cfb-broker` bridges this binding directly to the local S3 directory:
+To eliminate edge memory constraints (Cloudflare Workers 128 MB isolate limit), file transfers stream directly between the client browser and `cfb-broker`.
 
-```javascript
-// This exact code runs in Cloudflare edge (native R2) AND on cfb-broker (local NVMe)
-export default {
-  async fetch(request, env) {
-    if (request.method === "PUT") {
-      // Writes directly to local disk on cfb-broker; writes to R2 on Cloudflare
-      await env.ARTIFACTS.put("release.tar.gz", request.body, {
-        httpMetadata: { contentType: "application/gzip" }
-      });
-      return new Response("Uploaded", { status: 201 });
-    }
-
-    const obj = await env.ARTIFACTS.get("release.tar.gz");
-    return new Response(obj.body);
-  }
-};
+```
+[ Browser Client ]
+        |
+        | 1. POST /api/storage/presign
+        v
+[ Cloudflare Edge Worker ]  (Generates AWS SigV4 signed URL pointing to Tunnel)
+        |
+        | 2. Returns: https://s3.infra.example.com/artifacts/build.tar.gz?X-Amz-...
+        v
+[ Browser Client ]
+        |
+        | 3. PUT /artifacts/build.tar.gz (Streams directly to host NVMe)
+        v
+[ Cloudflare Tunnel Ingress ]
+        |
+        v
+[ cfb-broker Embedded S3 Engine ]
 ```
 
----
-
-## 5. Direct Browser Uploads via Presigned URLs
-
-To bypass Cloudflare Worker 128 MB memory limits, the edge Worker signs presigned URLs pointing through the tunnel directly to `cfb-broker`:
-
+### Worker Signing Implementation
 ```typescript
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
-export async function createPresignedUpload(env: Env, bucket: string, key: string): Promise<string> {
+export async function generateUploadUrl(env: Env, bucket: string, key: string): Promise<string> {
   const s3 = new S3Client({
-    endpoint: "https://s3.infra.yourdomain.com",
+    endpoint: "https://s3.infra.example.com",
     region: "auto",
     credentials: {
       accessKeyId: env.S3_ACCESS_KEY,
@@ -107,9 +78,7 @@ export async function createPresignedUpload(env: Env, bucket: string, key: strin
   });
 
   return await getSignedUrl(s3, new PutObjectCommand({ Bucket: bucket, Key: key }), {
-    expiresIn: 900, // 15 minutes
+    expiresIn: 900,
   });
 }
 ```
-
-The browser uploads directly through the Cloudflare Tunnel into the host's NVMe drive with zero intermediate buffering.

@@ -1,117 +1,88 @@
-# Unified Host Daemon: The `cfb-broker` Architecture in Rust
+# Host Daemon Specification: `cfb-broker`
 
-## 1. Motivation: Eliminating the Multi-Container Anti-Pattern
+## 1. Process Model and Resource Envelope
 
-Deploying self-hosted compute typically deteriorates into container sprawl:
-- `cloudflared` daemon in Go (~40 MB disk, ~40 MB RAM)
-- `docker-socket-proxy` in HAProxy (~15 MB RAM)
-- `woodpecker-server` in Go (~80 MB RAM)
-- `woodpecker-agent` in Go (~40 MB RAM)
-- `serverbee-agent` in Rust (~15 MB RAM)
-- `garage` S3 storage in Rust (~50 MB RAM)
-- `workerd` in C++ (~30 MB RAM)
+`cfb-broker` is a single static Rust executable running on the host server under systemd or as a rootless daemon.
 
-Total idle footprint: **~270 MB to 600 MB RAM**, 7 running containers, multiple volume mounts, complex Docker bridge networking, and frequent version drift.
-
-### The `cfb-broker` Solution
-Instead of orchestrating seven distinct tools, we consolidate all host responsibilities into **one single, unified Rust binary: `cfb-broker`**.
-
-Derived from the battle-tested networking architecture of [talaria0101/cfrs](https://github.com/talaria0101/cfrs), `cfb-broker` runs directly on the host (as a systemd service or minimal container) and acts as:
-1. The **Cloudflare Tunnel Client**.
-2. The **`workerd` Runtime Supervisor**.
-3. The **S3 Storage Engine**.
-4. The **Heavy CI Task Runner**.
-5. The **Host Telemetry Probe**.
-6. The **Docker / Sandbox Proxy**.
-
-Total idle footprint: **< 20 MB RAM**.
+- Static Binary Size: Under 15 MiB.
+- Resident Memory (RSS): Under 20 MiB idle.
+- Threading Model: Async event loop driven by Tokio with a multi-threaded runtime.
+- External Dependencies: Official `cloudflare/workerd` binary and local Docker or Podman Unix socket.
 
 ---
 
-## 2. Internal Subsystems of `cfb-broker`
+## 2. Subsystem Architecture
 
 ```
-┌────────────────────────────────────────────────────────────────────────────────────────┐
-│                         cfb-broker (Single Rust Executable)                            │
-├────────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                        │
-│  [1. Embedded Cloudflare Tunnel Transport (cfrs)]                                      │
-│    • Direct connection to Cloudflare Edge via QUIC or HTTP/2 over port 7844.           │
-│    • Resilient fallback: SSH remote forward on port 443 / HTTP CONNECT proxy.           │
-│    • Zero dependency on the official 40MB cloudflared Go binary.                       │
-│    • Authenticates requests via Cloudflare Access Service Token verification.          │
-│                                                                                        │
-│  [2. In-Process HTTP / RPC Dispatcher (Axum / Hyper / Tokio)]                          │
-│    • Routes incoming tunnel streams internally to modular subsystem handlers:          │
-│                                                                                        │
-│    ├── /s3/*          ──► Embedded S3 Storage Engine (NVMe directory backend)         │
-│    ├── /workerd/*     ──► Reverse proxy to supervised local workerd process            │
-│    ├── /ci/*          ──► Embedded CI task queue, runner, and live SSE log streamer    │
-│    ├── /docker/*      ──► Filtered Docker/Podman socket proxy (safe container ops)     │
-│    ├── /telemetry/*   ──► In-process sysinfo probe streaming CPU/RAM over WebSocket    │
-│    ├── /files/*       ──► Web SFTP archive handler (inspect/download container files)  │
-│    └── /mirrord/*     ──► mirrord remote agent bridge for local dev traffic mirroring   │
-│                                                                                        │
-│  [3. workerd Process Supervisor & Wrangler Compiler]                                   │
-│    • Supervises the official cloudflare/workerd C++ binary on a private Unix socket.   │
-│    • Ingests standard wrangler.jsonc files deployed from the Cloudflare Worker API.     │
-│    • Compiles wrangler.jsonc dynamically into workerd.capnp configurations.             │
-│    • Maps env.MY_BUCKET to local S3 directories; maps env.MY_DO to local SQLite.        │
-│    • Triggers seamless hot reloads via Cap'n Proto without dropping active sockets.    │
-│                                                                                        │
-│  [4. Embedded CI Runner Engine]                                                        │
-│    • Replaces Woodpecker / Drone.                                                      │
-│    • Connects to local /var/run/docker.sock to spawn ephemeral runner containers.      │
-│    • Mounts host cache directories (/var/cache/cfb-broker/...) for instant builds.     │
-│    • Streams stdout/stderr directly over Server-Sent Events (SSE) back over tunnel.    │
-│                                                                                        │
-│  [5. In-Process Telemetry Probe]                                                       │
-│    • Compiles the Rust sysinfo crate directly into the binary.                         │
-│    • Samples CPU (per-core), memory, swap, disk I/O, network RX/TX, and process trees. │
-│    • Replaces separate monitoring daemons with 0.1% CPU overhead.                      │
-│                                                                                        │
-│  [6. Userspace Virtual Networking Stack (cfrs net)]                                    │
-│    • Integrates smoltcp and libcfrsnet.so LD_PRELOAD interposer.                       │
-│    • Allows sandboxed processes to bind virtual 10.66.0.0/24 networks without root.    │
-└────────────────────────────────────────────────────────────────────────────────────────┘
++------------------------------------------------------------------------------------+
+|                         cfb-broker (Single Rust Executable)                        |
++------------------------------------------------------------------------------------+
+|                                                                                    |
+|  [1. Embedded Tunnel Ingress]                                                      |
+|    - QUIC / HTTP/2 transport to Cloudflare Edge.                                   |
+|    - Fallback SSH remote forward over port 443 via HTTP CONNECT proxy.             |
+|    - Validates CF-Access-Client-Id and CF-Access-Client-Secret headers.            |
+|                                                                                    |
+|  [2. In-Process Dispatcher]                                                        |
+|    Routes incoming tunnel requests to internal async handlers:                     |
+|    - /s3/*          -> Embedded S3 storage engine.                                 |
+|    - /workerd/*     -> Reverse proxy to supervised workerd process.                |
+|    - /ci/*          -> In-process task queue, container runner, and SSE logs.      |
+|    - /docker/*      -> Filtered Docker socket proxy for container management.      |
+|    - /telemetry/*   -> In-process sysinfo probe streaming host metrics.            |
+|    - /files/*       -> Container filesystem archive streamer (Web SFTP).           |
+|                                                                                    |
+|  [3. workerd Supervisor & Wrangler Compiler]                                       |
+|    - Supervises the official workerd process over a local Unix domain socket.      |
+|    - Parses incoming wrangler.jsonc files dynamically.                             |
+|    - Generates workerd.capnp configuration files in memory.                        |
+|    - Binds env.MY_BUCKET to local disk and env.MY_DO to SQLite.                    |
+|    - Hot-reloads workerd isolates without dropping existing sockets.               |
+|                                                                                    |
+|  [4. Embedded CI Runner Engine]                                                    |
+|    - Interacts directly with /var/run/docker.sock.                                 |
+|    - Spawns ephemeral containers for pipeline steps.                               |
+|    - Mounts persistent host cache directories.                                     |
+|    - Streams stdout and stderr over Server-Sent Events (SSE).                      |
+|                                                                                    |
+|  [5. In-Process Telemetry Probe]                                                   |
+|    - Samples sysinfo metrics: CPU (per-core), memory, swap, disk I/O, network.     |
+|    - Emits JSON payloads over WebSocket and HTTP endpoints.                        |
++------------------------------------------------------------------------------------+
 ```
 
 ---
 
-## 3. How `cfb-broker` Interfaces with Cloudflare
+## 3. Subsystem Technical Contracts
 
-### Tunnel Ingress: Two Operation Modes
-1. **Registered Production Tunnel**:
-   - `cfb-broker run --tunnel-token <TOKEN>`
-   - Authenticates directly against Cloudflare's Argo Tunnel edge using credentials issued in Cloudflare Zero Trust dashboard.
-   - Routes ingress traffic matching hostnames (`s3.infra.domain`, `workerd.infra.domain`, `ci.infra.domain`) directly to internal async handlers.
-2. **Anonymous Quick-Tunnel (Ad-Hoc / Preview Mode)**:
-   - `cfb-broker quick-tunnel`
-   - Leverages `cfrs::quicktunnel` to provision an anonymous `*.trycloudflare.com` URL with zero stored credentials.
-   - Ideal for temporary sandboxes, ephemeral PR previews, or staging environments.
+### 3.1 workerd Supervisor
+- Execution Target: Spawns `/usr/local/bin/workerd serve <config.capnp>`.
+- IPC Mechanism: Communication between `cfb-broker` and `workerd` occurs over loopback TCP (`127.0.0.1:8080`) or Unix domain socket (`/run/cfb-broker/workerd.sock`).
+- Dynamic Reload: When a new `wrangler.jsonc` and JavaScript bundle are received at `/workerd/deploy`, `cfb-broker` updates the Cap'n Proto configuration file and signals the `workerd` process or leverages its `workerLoader` API for in-memory module swapping.
 
-### Fallback Transport in Restricted Sandboxes
-If outbound UDP/QUIC and port 7844 are blocked by enterprise firewalls or locked-down cloud VPS security groups, `cfb-broker` uses the proven fallback mechanism from `cfrs`:
-- Establishes an SSH remote forward over port 443 through an HTTP CONNECT proxy.
-- Splices incoming visitor channels to an internal Unix domain socket.
-- The tunnel remains fully operational even on networks that block official `cloudflared`.
+### 3.2 In-Process S3 Engine
+- Path Mapping: Objects are stored at `<data_dir>/s3/<bucket>/<key>`.
+- Concurrency Control: Concurrent writes to the same key use atomic write-and-rename semantics (`.tmp-<uuid>` moved to target key on completion).
+- Metadata Storage: Object size, MIME type, and ETag are stored directly on disk alongside the object or in an embedded SQLite index.
 
----
+### 3.3 CI Task Runner
+- Execution Model: Each pipeline step maps to an isolated container run (`docker run --rm`).
+- Log Multiplexing: Docker 8-byte frame headers (byte 0: 1=stdout, 2=stderr; bytes 4 to 7: uint32 payload length) are parsed and forwarded line-by-line over SSE.
+- Caching: Host directory `/var/cache/cfb-broker/ci/<repo_id>` is mounted into the container at the configured cache path.
 
-## 4. Resource & Footprint Comparison
-
-| Dimension | 7-Container Docker Compose Stack | Single Binary `cfb-broker` + `workerd` |
-| :--- | :--- | :--- |
-| **Processes Running** | 7 daemons + auxiliary helpers | **2 processes** (`cfb-broker` + supervised `workerd`) |
-| **Disk Footprint** | ~1.4 GB (Multiple base images) | **~65 MB** (`cfb-broker` ~15MB, `workerd` ~50MB) |
-| **Idle Memory Consumption**| **350 MiB – 800 MiB RAM** | **< 25 MiB RAM total** |
-| **Startup Time** | 15–30 seconds | **< 200 milliseconds** |
-| **Configuration Files** | 7 files (compose, toml, yml, json) | **1 unified TOML file** (`/etc/cfb-broker.toml`) |
-| **Installation** | Requires Docker, Compose, and root | Single static binary; runs under unprivileged user |
+### 3.4 Telemetry Probe
+- Provider: Compiled Rust `sysinfo` library.
+- Metrics Emitted:
+  - `cpu_usage_pct`: global and per-core CPU utilization percentage.
+  - `mem_used_bytes` / `mem_total_bytes`: physical memory utilization.
+  - `swap_used_bytes` / `swap_total_bytes`: swap utilization.
+  - `disk_io_read_bytes` / `disk_io_write_bytes`: storage throughput.
+  - `net_rx_bytes` / `net_tx_bytes`: network interface throughput.
+- Update Frequency: Sampled every 2000 milliseconds.
 
 ---
 
-## 5. Host Configuration File (`/etc/cfb-broker.toml`)
+## 4. Host Configuration Schema (`/etc/cfb-broker.toml`)
 
 ```toml
 [server]
@@ -121,10 +92,9 @@ log_level = "info"
 
 [tunnel]
 token = "eyJhIjoiY2xvdWRmbGFyZXRva2Vu..."
-protocol = "auto" # Tries QUIC -> HTTP/2 -> SSH/CONNECT fallback
+protocol = "auto" # Values: auto, quic, http2, ssh_fallback
 
 [auth]
-# Validates Cloudflare Access Service Token on incoming tunnel requests
 cf_access_client_id = "your-service-token-id.access"
 cf_access_client_secret = "your-service-token-secret"
 
