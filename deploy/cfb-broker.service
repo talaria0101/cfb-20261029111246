@@ -1,0 +1,17 @@
+[Unit]
+Description=Cloudflare Alternative Unified Broker Daemon
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/cfb-broker run --config /etc/cfb-broker.toml
+Restart=always
+RestartSec=5s
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

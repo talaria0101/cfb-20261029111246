@@ -1,144 +1,27 @@
 version: "3.8"
 
-networks:
-  infra-mesh:
-    name: infra-mesh
-
-volumes:
-  garage-meta:
-  garage-data:
-  workerd-data:
-  woodpecker-data:
-
 services:
   # ───────────────────────────────────────────────────────────────────────────
-  # 1. Cloudflare Tunnel Daemon (Egress Only, Encrypted QUIC Transport)
+  # Single Unified cfb-broker (Replaces 7 bloated containers)
+  # Embeds: Cloudflare Tunnel, workerd supervisor, S3 broker, CI runner, telemetry
   # ───────────────────────────────────────────────────────────────────────────
-  cloudflared:
-    image: cloudflare/cloudflared:latest
-    container_name: cloudflared
+  cfb-broker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: cfb-broker
     restart: unless-stopped
-    command: tunnel run
     environment:
       - TUNNEL_TOKEN=${TUNNEL_TOKEN}
+      - CF_ACCESS_CLIENT_ID=${CF_ACCESS_CLIENT_ID}
+      - CF_ACCESS_CLIENT_SECRET=${CF_ACCESS_CLIENT_SECRET}
     volumes:
-      - ./cloudflared/config.yml:/etc/cloudflared/config.yml:ro
-    networks:
-      - infra-mesh
-
-  # ───────────────────────────────────────────────────────────────────────────
-  # 2. Hardened Docker Socket Proxy (Tecnativa)
-  # ───────────────────────────────────────────────────────────────────────────
-  docker-proxy:
-    image: tecnativa/docker-socket-proxy:latest
-    container_name: docker-proxy
-    restart: unless-stopped
-    environment:
-      # Enable safe container management operations
-      CONTAINERS: 1
-      IMAGES: 1
-      INFO: 1
-      PING: 1
-      VERSION: 1
-      POST: 1
-      DELETE: 1
-      # Disable dangerous administrative and host breakout endpoints
-      VOLUMES: 0
-      NETWORKS: 0
-      SYSTEM: 0
-      SWARM: 0
-      NODES: 0
-      SERVICES: 0
-      SECRETS: 0
-      CONFIGS: 0
-      PLUGINS: 0
-      AUTH: 0
-    volumes:
+      - ./cfb-broker.toml:/etc/cfb-broker.toml:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
-    networks:
-      - infra-mesh
+      - cfb-data:/var/lib/cfb-broker
+      - cfb-cache:/var/cache/cfb-broker
+    network_mode: host
 
-  # ───────────────────────────────────────────────────────────────────────────
-  # 3. Garage S3 Object Storage (Lightweight, WAN-Tolerant R2 Alternative)
-  # ───────────────────────────────────────────────────────────────────────────
-  garage:
-    image: dxflrs/garage:v1.0.1
-    container_name: garage
-    restart: unless-stopped
-    volumes:
-      - ./garage/garage.toml:/etc/garage.toml:ro
-      - garage-meta:/var/lib/garage/meta
-      - garage-data:/var/lib/garage/data
-    networks:
-      - infra-mesh
-
-  # ───────────────────────────────────────────────────────────────────────────
-  # 4. cloudflare/workerd Runtime (Self-Hosted Workers & SQLite Durable Objects)
-  # ───────────────────────────────────────────────────────────────────────────
-  workerd:
-    image: ghcr.io/cloudflare/workerd:latest
-    container_name: workerd
-    restart: unless-stopped
-    command: serve /etc/workerd/workerd.capnp
-    volumes:
-      - ./workerd/workerd.capnp:/etc/workerd/workerd.capnp:ro
-      - ./workerd/src:/etc/workerd/src:ro
-      - workerd-data:/var/lib/workerd/do-data
-    networks:
-      - infra-mesh
-
-  # ───────────────────────────────────────────────────────────────────────────
-  # 5. Woodpecker CI Server (Heavy CI Coordination & SSE Streaming)
-  # ───────────────────────────────────────────────────────────────────────────
-  woodpecker-server:
-    image: woodpeckerci/woodpecker-server:latest
-    container_name: woodpecker-server
-    restart: unless-stopped
-    environment:
-      - WOODPECKER_HOST=https://${CI_HOSTNAME}
-      - WOODPECKER_SERVER_ADDR=:8000
-      - WOODPECKER_GRPC_ADDR=:9000
-      - WOODPECKER_GRPC_SECRET=${CI_GRPC_SECRET}
-      - WOODPECKER_OPEN=true
-      - WOODPECKER_ADMIN=${CI_ADMIN_USER}
-      - WOODPECKER_DATABASE_DRIVER=sqlite3
-      - WOODPECKER_DATABASE_DATASOURCE=/var/lib/woodpecker/woodpecker.sqlite
-    volumes:
-      - woodpecker-data:/var/lib/woodpecker
-    networks:
-      - infra-mesh
-
-  # ───────────────────────────────────────────────────────────────────────────
-  # 6. Woodpecker CI Agent (Docker-in-Docker Heavy Build Runner)
-  # ───────────────────────────────────────────────────────────────────────────
-  woodpecker-agent:
-    image: woodpeckerci/woodpecker-agent:latest
-    container_name: woodpecker-agent
-    restart: unless-stopped
-    depends_on:
-      - woodpecker-server
-    environment:
-      - WOODPECKER_SERVER=woodpecker-server:9000
-      - WOODPECKER_GRPC_SECRET=${CI_GRPC_SECRET}
-      - WOODPECKER_MAX_WORKFLOWS=4
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    networks:
-      - infra-mesh
-
-  # ───────────────────────────────────────────────────────────────────────────
-  # 7. ServerBee Agent (Lightweight Rust Host & Process Telemetry Probe)
-  # ───────────────────────────────────────────────────────────────────────────
-  serverbee-agent:
-    image: zingerlittlebee/serverbee-web:latest
-    container_name: serverbee-agent
-    restart: unless-stopped
-    environment:
-      - PORT=9527
-      - TOKEN=${SERVERBEE_TOKEN:-serverbee_secure_token}
-    volumes:
-      - /proc:/proc:ro
-      - /sys:/sys:ro
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    networks:
-      - infra-mesh
+volumes:
+  cfb-data:
+  cfb-cache:

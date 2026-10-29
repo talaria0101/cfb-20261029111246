@@ -1,7 +1,6 @@
 /**
  * Cloudflare Worker Edge Control Plane
- * Orchestrates remote compute, storage, CI, and telemetry over Cloudflare Tunnels
- * Incorporates patterns from Amika, workerd, Garage, Woodpecker, ServerBee, Homelable, OmnySSH, mirrord, and cfrs.
+ * Connects to unified cfb-broker host daemon over Cloudflare Tunnel
  * License: 0BSD
  */
 
@@ -9,24 +8,19 @@ import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 export interface Env {
-  // Cloudflare Tunnel endpoints
-  DOCKER_TUNNEL_HOST: string;
-  STORAGE_TUNNEL_HOST: string;
-  WORKERD_TUNNEL_HOST: string;
-  CI_TUNNEL_HOST: string;
-  TELEMETRY_TUNNEL_HOST?: string;
+  // Cloudflare Tunnel endpoint pointing to cfb-broker
+  BROKER_TUNNEL_HOST: string; // e.g. "https://broker.infra.yourdomain.com"
 
   // Cloudflare Access Service Token credentials
   CF_ACCESS_CLIENT_ID: string;
   CF_ACCESS_CLIENT_SECRET: string;
 
-  // Storage credentials
-  GARAGE_ACCESS_KEY?: string;
-  GARAGE_SECRET_KEY?: string;
+  // S3 / R2 credentials
+  S3_ACCESS_KEY?: string;
+  S3_SECRET_KEY?: string;
 
-  // CI credentials
+  // Webhook secret
   GITHUB_WEBHOOK_SECRET?: string;
-  WOODPECKER_API_TOKEN?: string;
 }
 
 export default {
@@ -54,59 +48,41 @@ export default {
       }
 
       // ────────────────────────────────────────────────────────────────────────
-      // 2. Compute & Sandbox Management (Docker Socket Proxy over Tunnel)
+      // 2. Real-Time Telemetry Stream (from cfb-broker sysinfo probe)
+      // ────────────────────────────────────────────────────────────────────────
+      if (url.pathname === "/api/telemetry" && request.method === "GET") {
+        return await fetch(`${env.BROKER_TUNNEL_HOST}/telemetry/sample`, {
+          headers: getTunnelHeaders(env),
+        });
+      }
+
+      // ────────────────────────────────────────────────────────────────────────
+      // 3. Compute & Sandboxes (Proxied directly to cfb-broker)
       // ────────────────────────────────────────────────────────────────────────
       if (url.pathname === "/api/sandboxes/list" && request.method === "GET") {
-        return await proxyDocker(env, "/v1.44/containers/json?all=1", "GET");
+        return await fetch(`${env.BROKER_TUNNEL_HOST}/docker/containers/json?all=1`, {
+          headers: getTunnelHeaders(env),
+        });
       }
 
       if (url.pathname === "/api/sandboxes/spawn" && request.method === "POST") {
-        const body = await request.json<{ image: string; cmd?: string[]; memLimitMb?: number }>();
-        const image = body.image || "alpine:latest";
-        const memLimit = (body.memLimitMb || 512) * 1024 * 1024;
-
-        // 1. Create container with resource constraints
-        const createRes = await fetch(`${env.DOCKER_TUNNEL_HOST}/v1.44/containers/create`, {
+        return await fetch(`${env.BROKER_TUNNEL_HOST}/docker/spawn`, {
           method: "POST",
           headers: getTunnelHeaders(env),
-          body: JSON.stringify({
-            Image: image,
-            Cmd: body.cmd || ["/bin/sh"],
-            Tty: true,
-            OpenStdin: true,
-            HostConfig: {
-              Runtime: "runsc", // gVisor isolation (if configured on host)
-              Memory: memLimit,
-              NanoCpus: 1000000000, // 1 vCPU
-            },
-          }),
+          body: request.body,
         });
-
-        if (!createRes.ok) {
-          return new Response(await createRes.text(), { status: createRes.status });
-        }
-
-        const { Id: containerId } = await createRes.json<{ Id: string }>();
-
-        // 2. Start container
-        await fetch(`${env.DOCKER_TUNNEL_HOST}/v1.44/containers/${containerId}/start`, {
-          method: "POST",
-          headers: getTunnelHeaders(env),
-        });
-
-        return Response.json({ success: true, containerId });
       }
 
-      // Interactive terminal bridge via Docker WebSocket attach API
+      // Interactive terminal bridge via WebSocket
       if (url.pathname.startsWith("/api/sandboxes/terminal/")) {
         const containerId = url.pathname.split("/")[4];
         if (request.headers.get("Upgrade") !== "websocket") {
           return new Response("Expected WebSocket upgrade", { status: 426 });
         }
 
-        const wsUrl = new URL(env.DOCKER_TUNNEL_HOST);
+        const wsUrl = new URL(env.BROKER_TUNNEL_HOST);
         wsUrl.protocol = "wss:";
-        wsUrl.pathname = `/v1.44/containers/${containerId}/attach/ws`;
+        wsUrl.pathname = `/docker/containers/${containerId}/attach/ws`;
         wsUrl.search = "?stream=1&stdin=1&stdout=1&stderr=1";
 
         const originWsRes = await fetch(wsUrl.toString(), {
@@ -133,23 +109,20 @@ export default {
         return new Response(null, { status: 101, webSocket: client });
       }
 
-      // Web SFTP / Remote File Explorer (OmnySSH Pattern)
+      // Web SFTP File Explorer (OmnySSH Pattern)
       if (url.pathname.startsWith("/api/sandboxes/files/")) {
         const parts = url.pathname.split("/");
         const containerId = parts[4];
         const filePath = url.searchParams.get("path") || "/workspace";
 
-        if (request.method === "GET") {
-          // Download or stream archive from container
-          const targetUrl = `${env.DOCKER_TUNNEL_HOST}/v1.44/containers/${containerId}/archive?path=${encodeURIComponent(filePath)}`;
-          return await fetch(targetUrl, {
-            headers: getTunnelHeaders(env),
-          });
-        }
+        return await fetch(
+          `${env.BROKER_TUNNEL_HOST}/files/archive?id=${containerId}&path=${encodeURIComponent(filePath)}`,
+          { headers: getTunnelHeaders(env) }
+        );
       }
 
       // ────────────────────────────────────────────────────────────────────────
-      // 3. Storage Plane: Presigned URLs for Garage S3
+      // 4. Storage Plane: Presigned URLs for cfb-broker S3 Engine
       // ────────────────────────────────────────────────────────────────────────
       if (url.pathname === "/api/storage/presign" && request.method === "POST") {
         const { bucket, key, operation, contentType } = await request.json<{
@@ -160,11 +133,11 @@ export default {
         }>();
 
         const s3 = new S3Client({
-          endpoint: env.STORAGE_TUNNEL_HOST,
-          region: "garage",
+          endpoint: `${env.BROKER_TUNNEL_HOST}/s3`,
+          region: "auto",
           credentials: {
-            accessKeyId: env.GARAGE_ACCESS_KEY || "dummy",
-            secretAccessKey: env.GARAGE_SECRET_KEY || "dummy",
+            accessKeyId: env.S3_ACCESS_KEY || "cfb_access_key",
+            secretAccessKey: env.S3_SECRET_KEY || "cfb_secret_key",
           },
           forcePathStyle: true,
         });
@@ -188,21 +161,19 @@ export default {
       }
 
       // ────────────────────────────────────────────────────────────────────────
-      // 4. Heavy CI: Webhook Ingress & Live SSE Log Proxy
+      // 5. Heavy CI: Webhook Dispatch & Live SSE Log Proxy
       // ────────────────────────────────────────────────────────────────────────
       if (url.pathname === "/webhook/github" && request.method === "POST") {
         return await handleGitHubWebhook(request, env);
       }
 
       if (url.pathname.startsWith("/api/ci/logs/")) {
-        const subPath = url.pathname.replace("/api/ci/logs/", "");
-        const [repoId, pipeline, stepId] = subPath.split("/");
+        const jobId = url.pathname.replace("/api/ci/logs/", "");
+        const targetUrl = `${env.BROKER_TUNNEL_HOST}/ci/stream/${jobId}`;
 
-        const targetUrl = `${env.CI_TUNNEL_HOST}/api/stream/logs/${repoId}/${pipeline}/${stepId}`;
         const upstreamResponse = await fetch(targetUrl, {
           method: "GET",
           headers: {
-            Authorization: `Bearer ${env.WOODPECKER_API_TOKEN}`,
             Accept: "text/event-stream",
             ...getTunnelHeaders(env),
           },
@@ -227,11 +198,11 @@ export default {
       }
 
       // ────────────────────────────────────────────────────────────────────────
-      // 5. workerd Runtime & Durable Objects Gateway Proxy
+      // 6. workerd Runtime & Durable Objects Gateway Proxy
       // ────────────────────────────────────────────────────────────────────────
       if (url.pathname.startsWith("/api/workerd/")) {
         const subPath = url.pathname.replace("/api/workerd", "");
-        const targetUrl = new URL(subPath + url.search, env.WORKERD_TUNNEL_HOST);
+        const targetUrl = new URL(subPath + url.search, `${env.BROKER_TUNNEL_HOST}/workerd`);
 
         const headers = new Headers(request.headers);
         headers.set("CF-Access-Client-Id", env.CF_ACCESS_CLIENT_ID);
@@ -261,26 +232,10 @@ function getTunnelHeaders(env: Env): Record<string, string> {
   };
 }
 
-async function proxyDocker(env: Env, path: string, method: string): Promise<Response> {
-  const targetUrl = `${env.DOCKER_TUNNEL_HOST}${path}`;
-  const res = await fetch(targetUrl, {
-    method,
-    headers: getTunnelHeaders(env),
-  });
-  return new Response(res.body, {
-    status: res.status,
-    headers: {
-      "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": "*",
-    },
-  });
-}
-
-// Builds Homelable-style topology graph data structure
 async function handleTopologyGraph(env: Env): Promise<Response> {
   let containers: any[] = [];
   try {
-    const res = await fetch(`${env.DOCKER_TUNNEL_HOST}/v1.44/containers/json?all=1`, {
+    const res = await fetch(`${env.BROKER_TUNNEL_HOST}/docker/containers/json?all=1`, {
       headers: getTunnelHeaders(env),
     });
     if (res.ok) {
@@ -290,24 +245,21 @@ async function handleTopologyGraph(env: Env): Promise<Response> {
 
   const nodes = [
     { id: "cf-edge", label: "Cloudflare Edge (Workers/Pages)", type: "control-plane", status: "online" },
-    { id: "cf-tunnel", label: "Cloudflare Tunnel (cloudflared/cfrs)", type: "network", status: "online" },
-    { id: "host-node1", label: "Host Server (Hetzner Node 01)", type: "host", status: "online" },
-    { id: "svc-docker", label: "Docker Engine / gVisor", type: "runtime", status: "online" },
-    { id: "svc-garage", label: "Garage S3 Object Store", type: "storage", status: "online" },
-    { id: "svc-workerd", label: "workerd Standalone Runtime", type: "runtime", status: "online" },
-    { id: "svc-ci", label: "Woodpecker CI Engine", type: "ci", status: "online" },
+    { id: "cf-tunnel", label: "Cloudflare Tunnel (cfrs embedded)", type: "network", status: "online" },
+    { id: "host-broker", label: "cfb-broker (<20MB Rust Daemon)", type: "host", status: "online" },
+    { id: "svc-workerd", label: "workerd V8 Runtime (Drop-in Workers & SQLite DOs)", type: "runtime", status: "online" },
+    { id: "svc-s3", label: "Embedded S3 Storage (Drop-in R2)", type: "storage", status: "online" },
+    { id: "svc-ci", label: "Embedded CI Task Runner", type: "ci", status: "online" },
   ];
 
   const edges = [
     { from: "cf-edge", to: "cf-tunnel", protocol: "QUIC/HTTP3" },
-    { from: "cf-tunnel", to: "host-node1", protocol: "mTLS/Tunnel" },
-    { from: "host-node1", to: "svc-docker" },
-    { from: "host-node1", to: "svc-garage" },
-    { from: "host-node1", to: "svc-workerd" },
-    { from: "host-node1", to: "svc-ci" },
+    { from: "cf-tunnel", to: "host-broker", protocol: "mTLS/Tunnel" },
+    { from: "host-broker", to: "svc-workerd" },
+    { from: "host-broker", to: "svc-s3" },
+    { from: "host-broker", to: "svc-ci" },
   ];
 
-  // Append dynamic container nodes
   containers.forEach((c) => {
     const cId = `container-${c.Id.substring(0, 12)}`;
     nodes.push({
@@ -316,7 +268,7 @@ async function handleTopologyGraph(env: Env): Promise<Response> {
       type: "sandbox",
       status: c.State === "running" ? "online" : "stopped",
     });
-    edges.push({ from: "svc-docker", to: cId });
+    edges.push({ from: "host-broker", to: cId });
   });
 
   return Response.json({ nodes, edges, generatedAt: new Date().toISOString() });
@@ -340,8 +292,8 @@ async function handleGitHubWebhook(request: Request, env: Env): Promise<Response
     }
   }
 
-  // Forward verified webhook to Woodpecker Server behind Cloudflare Tunnel
-  const targetUrl = `${env.CI_TUNNEL_HOST}/api/hook`;
+  // Forward verified webhook to cfb-broker embedded CI runner over Cloudflare Tunnel
+  const targetUrl = `${env.BROKER_TUNNEL_HOST}/ci/dispatch`;
   return fetch(targetUrl, {
     method: "POST",
     headers: {

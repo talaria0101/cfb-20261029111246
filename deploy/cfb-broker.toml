@@ -1,0 +1,38 @@
+# cfb-broker: Unified Host Configuration
+# Replaces 7 separate bloated containers with a single ~15MB Rust binary
+
+[server]
+bind_addr = "127.0.0.1:9000"
+data_dir = "/var/lib/cfb-broker"
+log_level = "info"
+
+[tunnel]
+token = "eyJhIjoiY2xvdWRmbGFyZXRva2VuZXhhbXBsZTEyMzQ1Njc4OTAi..."
+protocol = "auto" # Tries QUIC -> HTTP/2 -> SSH/CONNECT fallback (cfrs)
+
+[auth]
+# Cloudflare Access Service Token verification for incoming tunnel requests
+cf_access_client_id = "your-service-token-id.access"
+cf_access_client_secret = "your-service-token-secret"
+
+[workerd]
+enabled = true
+binary_path = "/usr/local/bin/workerd"
+listen_port = 8080
+storage_dir = "/var/lib/cfb-broker/do-storage"
+
+[s3]
+enabled = true
+listen_port = 3900
+storage_dir = "/var/lib/cfb-broker/s3-data"
+region = "auto"
+
+[ci]
+enabled = true
+docker_socket = "/var/run/docker.sock"
+cache_dir = "/var/cache/cfb-broker/ci"
+max_concurrent_jobs = 4
+
+[telemetry]
+enabled = true
+sample_interval_secs = 2

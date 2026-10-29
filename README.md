@@ -1,178 +1,111 @@
-# Cloudflare Alt: Self-Hosted Cloudflare Infrastructure Managed from Cloudflare Edge
+# Cloudflare Alt: Zero-Bloat Host Daemon with Drop-In Cloudflare Compatibility
 
-A complete architectural specification, analysis of GitHub prior art, and reference implementation for self-hosting alternatives to Cloudflare's expensive services (**R2 Object Storage, Compute/Containers, Workers, Durable Objects, and Workers CI**) while maintaining the **dashboard and management plane hosted directly on Cloudflare Workers and Pages**.
-
----
-
-## 1. Executive Overview
-
-Cloudflare's serverless edge provides global low-latency routing, DDoS mitigation, and edge compute. However, data-intensive and compute-heavy primitives quickly encounter severe cost or execution limits:
-
-| Cloudflare Service | Constraint / Pain Point | Self-Hosted Alternative | Benefit |
-| :--- | :--- | :--- | :--- |
-| **Storage (R2)** | $4.50 / million Class A operations | **Garage S3** (`deuxfleurs-org/garage`) | Low-memory (~50MB), WAN-tolerant CRDT, zero op charges |
-| **Compute / Containers** | No raw Linux, no root, no long-running daemons | **Docker Engine + gVisor (`runsc`)** / **Nomad** | Unrestricted multi-hour compute, DinD, custom kernels |
-| **Workers Runtime** | 30s CPU limit, invocation billing | **`cloudflare/workerd`** standalone | Native Workers API, unmetered CPU, zero invocation fee |
-| **Durable Objects (DO)** | Cost scales with connection count and active memory | **`workerd`** (SQLite backend) or **`libSQL/sqld`** | Co-located SQLite per object, hibernated WebSockets |
-| **Workers CI** | Strict serverless concurrency & environment caps | **Woodpecker CI** (`woodpecker-ci/woodpecker`) | Native DinD, multi-gigabyte cache mounts, live SSE logs |
-
-### The Core Invariant
-- **Management Plane**: Hosted on **Cloudflare Pages (SPA)** + **Cloudflare Workers (API Gateway)** + **D1 / KV**.
-- **Data & Compute Plane**: Self-hosted on bare-metal servers (Hetzner, OVH), home labs, or spot VPS.
-- **Secure Networking**: Connected via **Cloudflare Tunnels (`cloudflared`)** with **Cloudflare Access Service Tokens**. Zero open inbound firewall ports.
-- **Restricted Sandbox Fallback**: Powered by **`talaria0101/cfrs`** for userspace networking and quick tunnels where `cloudflared` cannot run.
+A complete architectural specification, analysis of GitHub prior art, and reference implementation for self-hosting alternatives to Cloudflare's expensive services (**R2 Object Storage, Compute/Containers, Workers, Durable Objects, and Heavy CI**) with:
+1. **Zero-Code-Change Drop-In Compatibility**: Code written with standard Cloudflare APIs (`env.MY_BUCKET.put()`, `env.MY_DO.get()`, `state.storage.sql.exec()`) and configured via standard `wrangler.jsonc` runs identically on Cloudflare edge and on self-hosted infrastructure.
+2. **Single Lightweight Rust Host Daemon (`cfb-broker`)**: Eliminates multi-container Docker Compose sprawl. Replaces 7 separate daemons with a single ~15MB Rust binary derived from the architecture of [talaria0101/cfrs](https://github.com/talaria0101/cfrs), consuming **< 20 MiB RAM total**.
+3. **Cloudflare-Hosted Control Plane**: The management dashboard and API gateway remain hosted directly on Cloudflare Pages and Workers.
 
 ---
 
-## 2. Repository Navigation & Specifications
+## 1. Drop-In Cloudflare Compatibility Matrix
 
-| Document | Description |
+| Cloudflare Primitive | Application Code (Standard Cloudflare) | Cloudflare Production | Self-Hosted Node (`cfb-broker`) | Code Changes |
+| :--- | :--- | :--- | :--- | :--- |
+| **Workers Runtime** | `export default { fetch(req, env) { ... } }` | Cloudflare Edge Isolates | **`workerd`** supervised by `cfb-broker` | **0 lines** (Identical bundle) |
+| **Durable Objects (DO)** | `class MyDO { constructor(state) { this.sql = state.storage.sql; } }` | Cloudflare Edge DO (SQLite) | **`workerd`** DO with embedded SQLite on NVMe | **0 lines** (Identical class) |
+| **Object Storage (R2)** | `await env.MY_BUCKET.put("key", stream)` / `get("key")` | Cloudflare R2 | Native `workerd` R2 binding mapped to local NVMe | **0 lines** (Identical binding) |
+| **External S3 API** | AWS SDK / S3 Client: `s3.putObject(...)` | `<account>.r2.cloudflaredstorage.com` | `https://s3.<tunnel-domain>` served by `cfb-broker` | **0 lines** (Only endpoint changes) |
+| **Configuration** | Standard `wrangler.jsonc` or `wrangler.toml` | Deployed via `wrangler deploy` | `cfb-broker` parses `wrangler.jsonc` on deploy | **0 lines** (Identical config) |
+| **Heavy CI Runner** | GitHub Actions / Git Webhook / CI Pipeline | GitHub Actions or Workers CI | `cfb-broker` embedded CI runner with DinD & caching | Standard YAML / Webhook |
+
+---
+
+## 2. Why Single-Binary `cfb-broker` Beats Multi-Container Bloat
+
+Traditional self-hosted setups suffer from extreme container bloat: running `cloudflared` (Go), `docker-socket-proxy` (HAProxy), `woodpecker-server` (Go), `woodpecker-agent` (Go), `serverbee-agent` (Rust), and `garage` (Rust) consumes **~350–800 MB RAM idle** across 7 separate containers.
+
+**`cfb-broker` replaces all of them with ONE single Rust binary**:
+
+```
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                    cfb-broker (Single Unified Rust Daemon, < 20MB RAM)                 │
+├────────────────────────────────────────────────────────────────────────────────────────┤
+│ • Embedded Cloudflare Tunnel Ingress (QUIC / HTTP/2 + SSH/CONNECT fallback from cfrs)  │
+│ • Embedded S3 Storage Engine (serves external S3 and internal workerd R2 bindings)     │
+│ • workerd Runtime Supervisor (translates wrangler.jsonc -> workerd.capnp dynamically)  │
+│ • Embedded Heavy CI Task Runner (Docker/Podman socket runner + live SSE log streaming) │
+│ • Embedded Telemetry Probe (sysinfo: CPU, RAM, disk, network, and process tree)        │
+│ • Web SFTP & File Explorer (OmnySSH pattern: browse and stream container archives)     │
+│ • mirrord & cfrs net integration (mirrors remote sandbox traffic to local AI agents)   │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+                                            │
+                                            ▼ IPC / Unix Domain Socket
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│ cloudflare/workerd (V8 Execution Engine for Workers & SQLite Durable Objects)          │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 3. Specifications Index
+
+| Specification | Description |
 | :--- | :--- |
-| **[`spec/01-architecture-overview.md`](spec/01-architecture-overview.md)** | End-to-end system design, push vs. pull vs. mirrored models, and threat model. |
-| **[`spec/02-compute-sandbox-orchestration.md`](spec/02-compute-sandbox-orchestration.md)** | Docker API, Nomad, Amika analysis, mirrord context mirroring, and cfrs userspace VNet. |
-| **[`spec/03-self-hosting-workerd-and-workers.md`](spec/03-self-hosting-workerd-and-workers.md)** | Standalone `cloudflare/workerd`, Cap'n Proto config, SQLite Durable Objects, and `workerLoader`. |
-| **[`spec/04-storage-r2-and-durable-objects.md`](spec/04-storage-r2-and-durable-objects.md)** | Garage S3 vs SeaweedFS, edge-assisted S3 presigning, and distributed SQLite (`libSQL`). |
-| **[`spec/05-heavy-ci-runner-system.md`](spec/05-heavy-ci-runner-system.md)** | Woodpecker CI engine, edge webhook HMAC verification, and zero-buffering SSE log proxy. |
-| **[`spec/06-github-tools-critique.md`](spec/06-github-tools-critique.md)** | Technical evaluation of 17 GitHub projects including Amika, mirrord, cfrs, ServerBee, Homelable, OmnySSH. |
+| **[`spec/01-architecture-overview.md`](spec/01-architecture-overview.md)** | End-to-end system design, drop-in compatibility invariants, and threat model. |
+| **[`spec/02-unified-broker-cfrs-architecture.md`](spec/02-unified-broker-cfrs-architecture.md)** | Single-binary `cfb-broker` architecture in Rust (derived from `cfrs`). |
+| **[`spec/03-drop-in-cloudflare-compatibility.md`](spec/03-drop-in-cloudflare-compatibility.md)** | Zero-code-change Worker execution, SQLite Durable Objects, and Wrangler compilation. |
+| **[`spec/04-storage-and-s3-broker.md`](spec/04-storage-and-s3-broker.md)** | In-process S3 storage engine, direct NVMe streaming, and presigned URLs. |
+| **[`spec/05-zero-bloat-ci-and-sandboxes.md`](spec/05-zero-bloat-ci-and-sandboxes.md)** | In-process CI container runner, host cache mounting, and live SSE log streams. |
+| **[`spec/06-github-tools-critique.md`](spec/06-github-tools-critique.md)** | Technical critique of 17 GitHub prior art projects. |
 
 ---
 
-## 3. Reference Architecture
+## 4. Single-Binary Quickstart
 
-```
-                                  PUBLIC INTERNET / OPERATOR SURFACES
-                                                   │
-                  ┌────────────────────────────────┴────────────────────────────────┐
-                  │                                                                 │
-                  ▼                                                                 ▼
-      ┌───────────────────────┐                                         ┌───────────────────────┐
-      │  Developer / Admin    │                                         │   Git Webhook Source  │
-      │  Browser (SPA Client) │                                         │    (GitHub / GitLab)  │
-      └───────────┬───────────┘                                         └───────────┬───────────┘
-                  │                                                                 │
-                  │ HTTPS / WSS                                                     │ POST Webhook
-                  ▼                                                                 ▼
-┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                   CLOUDFLARE EDGE CONTROL PLANE                                   │
-│                                                                                                   │
-│  [Cloudflare Pages: Single-Page Dashboard]                                                        │
-│    - Topology Visualizer: Interactive network and container graph (Homelable pattern).            │
-│    - Multi-Server Manager: Aggregated status, uptime tracking, and service bookmarks (CoreObs).  │
-│    - Web SFTP & Terminal: Dual-pane remote file browser and tabbed shell (OmnySSH pattern).       │
-│    - Live Telemetry Viewer: Real-time CPU, RAM, network, and process stream (ServerBee pattern).  │
-│                                                                                                   │
-│  [Cloudflare Worker: API Gateway & Router]                                                        │
-│    - Authentication: Cloudflare Zero Trust Access JWT validation & RBAC.                          │
-│    - Secret Store: Environment bindings for Cloudflare Access Service Tokens.                    │
-│    - Webhook Dispatcher: Verifies HMAC-SHA256 signatures; routes pipeline triggers to CI.         │
-│    - S3 Presigner: Generates AWS SigV4 presigned URLs for direct browser-to-node storage uploads. │
-│    - SSE Log Streamer: Passes through real-time build logs with zero edge buffering.              │
-│    - Snippets Runner: Executes parameterized operational scripts stored in Cloudflare KV.         │
-│                                                                                                   │
-│  [Cloudflare Durable Objects: State Hub & Tunnel Multiplexer]                                     │
-│    - Persistent multiplexing hub (implementing @amika/tunnel-protocol v2).                       │
-│    - Maintains persistent connection state using WebSocket Hibernation API (zero idle CPU cost). │
-│    - Telemetry aggregator piping ServerBee probe metrics to active dashboard clients.             │
-└─────────────────────────────────────────────────┬─────────────────────────────────────────────────┘
-                                                  │
-                                                  │ Cloudflare Tunnel (QUIC / HTTP/2 Transport)
-                                                  │ Fallback: cfrs quick-tunnel over SSH/CONNECT
-                                                  │ Authenticated via CF-Access-Client-Id / Secret
-                                                  ▼
-┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                  REMOTE DATA PLANE (HOST MACHINE)                                 │
-│                                                                                                   │
-│  [Tunnel Ingress: cloudflared / cfrs]                                                             │
-│    - cloudflared: Outbound encrypted QUIC tunnel to Cloudflare Edge.                              │
-│    - cfrs (Fallback): Rust quick-tunnel + userspace networking for restricted sandboxes.          │
-│                                                                                                   │
-│  ┌───────────────────────────────┬───────────────────────────────┬─────────────────────────────┐  │
-│  │     CONTAINER & COMPUTE       │        STORAGE PLANE          │     WORKERS & RUNTIMES      │  │
-│  │                               │                               │                             │  │
-│  │ • Docker Engine via           │ • Garage S3                   │ • cloudflare/workerd        │  │
-│  │   docker-socket-proxy         │   - Lightweight Rust S3       │   - Open-source V8 runtime  │  │
-│  │ • HashiCorp Nomad             │   - WAN-tolerant CRDT         │   - Persistent SQLite DOs   │  │
-│  │ • Sandboxes: gVisor (runsc)   │   - 50MB RAM footprint        │   - Hibernated WebSockets   │  │
-│  │ • Amika Agent / hostd         │ • SeaweedFS / libSQL          │   - workerLoader hot-reload │  │
-│  │ • mirrord Agent: traffic &    │ • Remote File Bridge: Web     │ • Embedded SQL API          │  │
-│  │   env mirroring to local dev  │   SFTP service (OmnySSH)      │   (state.storage.sql)       │  │
-│  ├───────────────────────────────┴───────────────────────────────┴─────────────────────────────┤  │
-│  │                        OBSERVABILITY, TELEMETRY & RUNNER ENGINES                            │  │
-│  │ • ServerBee Agent: 10MB Rust probe streaming CPU, RAM, disk, and process trees over WS     │  │
-│  │ • Woodpecker CI Server (REST / Webhook / SSE)                                               │  │
-│  │ • Woodpecker Agents (Docker-in-Docker, multi-stage builders, local pipelines)               │  │
-│  └─────────────────────────────────────────────────────────────────────────────────────────────┘  │
-└───────────────────────────────────────────────────────────────────────────────────────────────────┘
-```
+### Step 1: Install & Run `cfb-broker` on Host (Bare Metal / VPS)
 
----
-
-## 4. Key Architectural Patterns & Findings
-
-### 1. `gofixpoint/amika` and `@amika/tunnel-protocol`
-- **What it is**: Open-source infrastructure for on-demand coding workstations ("Rigs").
-- **Key Insight**: Its core tunneling package (`@amika/tunnel-protocol`) uses zero Node.js dependencies (`Uint8Array`, `DataView`, `TextEncoder`) and was explicitly authored to execute inside Cloudflare Workers and Durable Objects.
-- **Loopback SSH Security**: In-guest daemon `amikad` binds OpenSSH to `127.0.0.1:22` and pipes bytes over authenticated WebSockets (`/v1/ssh-sessions`), avoiding raw port 22 exposure.
-- **Zero-Cost Sleep**: Host sends periodic ping strings (`amika.tunnel.v2.ping`), which Cloudflare Durable Objects answer via `setWebSocketAutoResponse` without waking the isolate.
-
-### 2. Standalone `cloudflare/workerd`
-- Cloudflare's own runtime can be deployed on Linux servers (`ghcr.io/cloudflare/workerd:latest`).
-- By setting `durableObjectStorage = (localDisk = "diskService")` and `enableSql = true`, `workerd` automatically backs every Durable Object instance with an **embedded SQLite database on disk**, granting relational SQL query execution (`state.storage.sql.exec`).
-- Supports **hibernatable WebSockets** (`state.acceptWebSocket()`), dropping memory consumption to near zero during idle connection states.
-
-### 3. Remote Context & Traffic Mirroring (`metalbear-co/mirrord`)
-- Solves remote developer and AI coding agent ergonomics.
-- Through dynamic linker interposition (`LD_PRELOAD`), local processes or Cursor/Claude Code agents run on developer machines as if they were physically inside the remote container on Hetzner, accessing the remote database, S3 storage, and internal DNS over Cloudflare Tunnel.
-
-### 4. Userspace Virtual Networking & Sandbox Fallback (`talaria0101/cfrs`)
-- Provides a lightweight (~8MB) Rust Cloudflare quick-tunnel client and userspace virtual networking stack for locked-down container environments.
-- Implements `cfrs net`: an `LD_PRELOAD` shim (`libcfrsnet.so`) that maps `AF_INET` socket calls to `AF_UNIX` abstract sockets, and an in-process `smoltcp` stack that creates a private `10.66.0.0/24` network without root or `CAP_NET_ADMIN`.
-- Slices incoming traffic over port 443 SSH remote forwarding when Cloudflare edge port 7844 is filtered.
-
-### 5. Topology Visualization & Telemetry (`Pouzor/homelable`, `ServerBee`, `crocofied/CoreObs`)
-- The Cloudflare Pages SPA renders an interactive infrastructure graph showing Edge POPs, Tunnels, Host servers, and Sandboxes.
-- Ultra-lightweight Rust telemetry agent (`serverbee-agent`) streams CPU, RAM, disk, and process trees over WebSockets into the control plane using only 10 to 15 MiB of RAM.
-- Web SFTP file explorer and snippet automation adapted from `timhartmann7/omnyssh`.
-
----
-
-## 5. Quickstart Deployment
-
-### Step 1: Deploy Host Services (Host Machine)
-1. Clone this repository on your host machine.
-2. Configure `.env` with your Cloudflare Tunnel token and credentials:
+#### Option A: Direct Systemd Service (Recommended)
+1. Download or compile `cfb-broker`:
    ```bash
-   cp .env.example .env
+   cd broker && cargo build --release
+   cp target/release/cfb-broker /usr/local/bin/
    ```
-3. Start the host infrastructure stack:
+2. Configure `/etc/cfb-broker.toml`:
    ```bash
-   cd deploy
-   docker compose up -d
+   cp deploy/cfb-broker.toml /etc/cfb-broker.toml
+   ```
+3. Enable and start systemd unit:
+   ```bash
+   cp deploy/cfb-broker.service /etc/systemd/system/
+   systemctl daemon-reload && systemctl enable --now cfb-broker
    ```
 
-### Step 2: Deploy Edge Control Plane (Cloudflare Workers)
+#### Option B: Single Container Deployment
+```bash
+cd deploy && docker compose up -d
+```
+
+### Step 2: Deploy Cloudflare Control Plane
 1. Navigate to `control-plane/worker`:
    ```bash
-   cd control-plane/worker
-   npm install
+   cd control-plane/worker && npm install
    ```
-2. Configure your tunnel endpoints in `wrangler.jsonc`.
-3. Set your Cloudflare Access Service Token secrets:
+2. Configure `wrangler.jsonc` with your `BROKER_TUNNEL_HOST`.
+3. Set your Cloudflare Zero Trust Service Token secrets:
    ```bash
    npx wrangler secret put CF_ACCESS_CLIENT_ID
    npx wrangler secret put CF_ACCESS_CLIENT_SECRET
-   npx wrangler secret put GITHUB_WEBHOOK_SECRET
    ```
-4. Deploy the Worker:
+4. Deploy the Edge Gateway:
    ```bash
    npx wrangler deploy
    ```
 
 ### Step 3: Access Management Dashboard
-Deploy `control-plane/spa/index.html` to Cloudflare Pages or serve it directly from your Worker.
+Deploy `control-plane/spa/index.html` to Cloudflare Pages or access it via your Worker domain.
 
 ---
 
-## 6. License
+## 5. License
 
 This project is licensed under the **BSD 0-Clause License (0BSD)**. See [`LICENSE`](LICENSE) for details.

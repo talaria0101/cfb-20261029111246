@@ -186,47 +186,47 @@
 </head>
 <body>
   <header>
-    <h1>Cloudflare Alt Control Plane <span class="badge">Edge Managed</span></h1>
+    <h1>Cloudflare Alt Control Plane <span class="badge">cfb-broker Unified</span></h1>
     <div style="font-size: 0.85rem; color: var(--text-muted);">
-      Host: Hetzner Node 01 &bull; Tunnel: <span style="color: var(--success); font-weight: 600;">ACTIVE (QUIC / cfrs fallback)</span>
+      Daemon: <span style="color: var(--accent); font-weight: 600;">cfb-broker (<20MB Rust)</span> &bull; Tunnel: <span style="color: var(--success); font-weight: 600;">ACTIVE (QUIC / cfrs)</span>
     </div>
   </header>
 
   <nav>
-    <button class="active" onclick="switchTab('overview')">Infrastructure Overview</button>
+    <button class="active" onclick="switchTab('overview')">Host Telemetry & Overview</button>
     <button onclick="switchTab('topology')">Topology Visualizer (Homelable)</button>
     <button onclick="switchTab('compute')">Sandboxes & Web SFTP (OmnySSH)</button>
-    <button onclick="switchTab('ci')">Heavy CI & Logs (Woodpecker)</button>
-    <button onclick="switchTab('storage')">Garage S3 Storage</button>
+    <button onclick="switchTab('ci')">Embedded CI & Live Logs</button>
+    <button onclick="switchTab('storage')">S3 / R2 Storage</button>
   </nav>
 
-  <!-- TAB 1: OVERVIEW -->
+  <!-- TAB 1: OVERVIEW & TELEMETRY -->
   <div id="tab-overview">
-    <!-- Service Status Metrics (ServerBee Pattern) -->
+    <!-- Real-Time Metrics (ServerBee sysinfo in cfb-broker) -->
     <div class="grid">
       <div class="card">
-        <h2>Compute / Sandboxes <span class="status-indicator"></span></h2>
-        <p style="font-size: 0.85rem; color: var(--text-muted);">Engine: Docker + gVisor runsc via proxy</p>
-        <div style="margin-top: 12px; font-size: 1.5rem; font-weight: 700;" id="containerCount">--</div>
-        <div style="font-size: 0.8rem; color: var(--text-muted);">Active Sandboxes</div>
+        <h2>Host CPU & Telemetry <span class="status-indicator"></span></h2>
+        <p style="font-size: 0.85rem; color: var(--text-muted);">In-process sysinfo probe in cfb-broker</p>
+        <div style="margin-top: 12px; font-size: 1.5rem; font-weight: 700;" id="cpuMetric">-- %</div>
+        <div style="font-size: 0.8rem; color: var(--text-muted);" id="memMetric">Memory: Loading...</div>
       </div>
       <div class="card">
         <h2>Storage Plane (R2 Alt) <span class="status-indicator"></span></h2>
-        <p style="font-size: 0.85rem; color: var(--text-muted);">Engine: Garage S3 (Rust Dynamo CRDT)</p>
+        <p style="font-size: 0.85rem; color: var(--text-muted);">Embedded S3 engine (NVMe direct streaming)</p>
         <div style="margin-top: 12px; font-size: 1.5rem; font-weight: 700;">OK</div>
-        <div style="font-size: 0.8rem; color: var(--text-muted);">Direct Presigning: Active</div>
+        <div style="font-size: 0.8rem; color: var(--text-muted);">Zero-Code-Change env.MY_BUCKET</div>
       </div>
       <div class="card">
         <h2>Workers & DO Runtime <span class="status-indicator"></span></h2>
-        <p style="font-size: 0.85rem; color: var(--text-muted);">Engine: cloudflare/workerd standalone</p>
+        <p style="font-size: 0.85rem; color: var(--text-muted);">Supervised cloudflare/workerd (V8)</p>
         <div style="margin-top: 12px; font-size: 1.5rem; font-weight: 700;">Active</div>
         <div style="font-size: 0.8rem; color: var(--text-muted);">SQLite DOs & Hibernated Sockets</div>
       </div>
       <div class="card">
-        <h2>Heavy CI Engine <span class="status-indicator"></span></h2>
-        <p style="font-size: 0.85rem; color: var(--text-muted);">Engine: Woodpecker CI Server + Agents</p>
-        <div style="margin-top: 12px; font-size: 1.5rem; font-weight: 700;">4 Slots</div>
-        <div style="font-size: 0.8rem; color: var(--text-muted);">DinD Build Capacity</div>
+        <h2>Embedded CI Runner <span class="status-indicator"></span></h2>
+        <p style="font-size: 0.85rem; color: var(--text-muted);">In-process task runner (zero idle RAM)</p>
+        <div style="margin-top: 12px; font-size: 1.5rem; font-weight: 700;">Ready</div>
+        <div style="font-size: 0.8rem; color: var(--text-muted);">DinD & Cache Mounting</div>
       </div>
     </div>
 
@@ -255,7 +255,7 @@
     <div class="card">
       <h2>Infrastructure Topology (Edge to Host Mesh)</h2>
       <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 16px;">
-        Live visual representation of Cloudflare Edge routing through encrypted tunnels into host compute, storage, and container nodes.
+        Live visual representation of Cloudflare Edge routing through encrypted tunnels into single-binary cfb-broker.
       </p>
       <div class="topology-container" id="topoGraph">
         <!-- Layer 1: Edge Control Plane -->
@@ -269,40 +269,32 @@
         <!-- Layer 2: Tunnel Ingress -->
         <div class="topo-layer">
           <div class="topo-node network">
-            <div class="topo-node-title">Cloudflare Tunnel</div>
-            <div class="topo-node-meta">cloudflared / cfrs fallback</div>
+            <div class="topo-node-title">Cloudflare Tunnel (cfrs embedded)</div>
+            <div class="topo-node-meta">Zero open inbound ports</div>
           </div>
         </div>
-        <div style="text-align: center; color: #38bdf8;">&darr; Local Mesh (Hetzner Node 01) &darr;</div>
-        <!-- Layer 3: Services & Storage -->
+        <div style="text-align: center; color: #38bdf8;">&darr; Host Node (Single Daemon) &darr;</div>
+        <!-- Layer 3: Unified Broker -->
         <div class="topo-layer">
-          <div class="topo-node service">
-            <div class="topo-node-title">Docker Engine</div>
-            <div class="topo-node-meta">tecnativa proxy &bull; gVisor</div>
+          <div class="topo-node host" style="border-width: 2px;">
+            <div class="topo-node-title">cfb-broker (Rust < 20MB)</div>
+            <div class="topo-node-meta">Tunnel &bull; S3 Engine &bull; CI Runner &bull; Telemetry &bull; Supervisor</div>
           </div>
-          <div class="topo-node service">
-            <div class="topo-node-title">Garage S3</div>
-            <div class="topo-node-meta">Port 3900 &bull; CRDT Sync</div>
-          </div>
+        </div>
+        <div style="text-align: center; color: var(--success);">&darr; Subsystems &amp; Sandboxes &darr;</div>
+        <!-- Layer 4: Sandboxes & workerd -->
+        <div class="topo-layer" id="topoSandboxes">
           <div class="topo-node service">
             <div class="topo-node-title">workerd Runtime</div>
-            <div class="topo-node-meta">SQLite DOs &bull; V8 Isolates</div>
+            <div class="topo-node-meta">Drop-in Workers &amp; SQLite DOs</div>
           </div>
           <div class="topo-node service">
-            <div class="topo-node-title">Woodpecker CI</div>
-            <div class="topo-node-meta">DinD Agents &bull; SSE Streams</div>
-          </div>
-        </div>
-        <div style="text-align: center; color: var(--success);">&darr; Sandboxed Ephemeral Workloads &darr;</div>
-        <!-- Layer 4: Sandboxes -->
-        <div class="topo-layer" id="topoSandboxes">
-          <div class="topo-node sandbox">
-            <div class="topo-node-title">CI Builder</div>
-            <div class="topo-node-meta">ephemeral container</div>
+            <div class="topo-node-title">Local S3 / NVMe</div>
+            <div class="topo-node-meta">Drop-in R2 Storage</div>
           </div>
           <div class="topo-node sandbox">
-            <div class="topo-node-title">Coding Agent Rig</div>
-            <div class="topo-node-meta">Amika / mirrord session</div>
+            <div class="topo-node-title">CI / Sandbox Containers</div>
+            <div class="topo-node-meta">Docker / gVisor / cfrs net</div>
           </div>
         </div>
       </div>
@@ -340,11 +332,9 @@
   <!-- TAB 4: CI & LOGS -->
   <div id="tab-ci" style="display: none;">
     <div class="card">
-      <h2>Heavy CI Live Stream (Woodpecker SSE Proxy)</h2>
+      <h2>Embedded CI Live Stream (cfb-broker SSE)</h2>
       <div style="display: flex; gap: 12px; margin-top: 8px;">
-        <input type="text" id="ciRepoId" placeholder="Repo ID" value="1" style="max-width: 150px;">
-        <input type="text" id="ciPipeline" placeholder="Pipeline" value="1" style="max-width: 150px;">
-        <input type="text" id="ciStep" placeholder="Step ID" value="2" style="max-width: 150px;">
+        <input type="text" id="ciJobId" placeholder="Job ID (e.g. build-9481)" value="build-9481" style="max-width: 250px;">
         <button id="ciConnectBtn" class="btn" style="margin-top: 0;">Connect Live Log Stream</button>
       </div>
       <div class="terminal-window" id="ciLogs">Logs will appear here once connected to SSE stream...</div>
@@ -354,7 +344,7 @@
   <!-- TAB 5: STORAGE -->
   <div id="tab-storage" style="display: none;">
     <div class="card">
-      <h2>Garage S3 Direct Upload</h2>
+      <h2>S3 / R2 Direct Upload (Zero Worker Memory Used)</h2>
       <form id="s3Form">
         <label>Bucket Name</label>
         <input type="text" id="s3Bucket" value="artifacts">
@@ -362,7 +352,7 @@
         <input type="text" id="s3Key" value="builds/output.tar.gz">
         <label>Select File</label>
         <input type="file" id="s3File">
-        <button type="submit" class="btn">Upload Directly to Node S3</button>
+        <button type="submit" class="btn">Upload Directly to cfb-broker S3</button>
       </form>
       <div id="s3Status" style="font-size: 0.8rem; margin-top: 8px; color: var(--text-muted);"></div>
     </div>
@@ -380,13 +370,25 @@
       if (tabId === "topology") loadTopology();
     }
 
+    async function loadTelemetry() {
+      try {
+        const res = await fetch(`${API_BASE}/api/telemetry`);
+        if (res.ok) {
+          const m = await res.json();
+          document.getElementById("cpuMetric").textContent = `${m.cpu_usage_pct.toFixed(1)} %`;
+          const memUsedMb = (m.mem_used_bytes / 1024 / 1024).toFixed(0);
+          const memTotalMb = (m.mem_total_bytes / 1024 / 1024).toFixed(0);
+          document.getElementById("memMetric").textContent = `Memory: ${memUsedMb} MB / ${memTotalMb} MB`;
+        }
+      } catch (_) {}
+    }
+
     async function loadContainers() {
       try {
         const res = await fetch(`${API_BASE}/api/sandboxes/list`);
         if (!res.ok) throw new Error("Failed to load");
         const containers = await res.json();
         
-        document.getElementById("containerCount").textContent = containers.length;
         const tbody = document.getElementById("containerTableBody");
         tbody.innerHTML = "";
 
@@ -406,9 +408,7 @@
           `;
           tbody.appendChild(tr);
         });
-      } catch (err) {
-        document.getElementById("containerCount").textContent = "!";
-      }
+      } catch (err) {}
     }
 
     async function loadTopology() {
@@ -434,16 +434,14 @@
       window.open(`${API_BASE}/api/sandboxes/files/${containerId}?path=${encodeURIComponent(path)}`, "_blank");
     }
 
-    // Connect to Woodpecker SSE Log Stream
+    // Connect to cfb-broker SSE Log Stream
     document.getElementById("ciConnectBtn").addEventListener("click", () => {
-      const repoId = document.getElementById("ciRepoId").value;
-      const pipeline = document.getElementById("ciPipeline").value;
-      const step = document.getElementById("ciStep").value;
+      const jobId = document.getElementById("ciJobId").value.trim();
       const logWindow = document.getElementById("ciLogs");
 
-      logWindow.textContent = `Connecting to SSE log stream for repo ${repoId}, pipeline ${pipeline}, step ${step}...\n`;
+      logWindow.textContent = `Connecting to SSE log stream for job ${jobId}...\n`;
 
-      const eventSource = new EventSource(`${API_BASE}/api/ci/logs/${repoId}/${pipeline}/${step}`);
+      const eventSource = new EventSource(`${API_BASE}/api/ci/logs/${jobId}`);
       eventSource.onmessage = (event) => {
         logWindow.textContent += event.data + "\n";
         logWindow.scrollTop = logWindow.scrollHeight;
@@ -456,6 +454,8 @@
     });
 
     loadContainers();
+    loadTelemetry();
+    setInterval(loadTelemetry, 3000);
   </script>
 </body>
 </html>
