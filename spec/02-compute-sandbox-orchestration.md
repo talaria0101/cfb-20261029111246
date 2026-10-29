@@ -1,4 +1,4 @@
-# Compute & Sandbox Orchestration: Docker, Nomad, MicroVMs, and Amika
+# Compute & Sandbox Orchestration: Docker, Nomad, MicroVMs, Amika, and Mirrord
 
 ## 1. Remote Container Management from Edge Isolates
 
@@ -13,6 +13,7 @@ The Docker daemon exposes a comprehensive REST API over Unix domain socket (`/va
 - Container lifecycle: `POST /v1.44/containers/create`, `POST /v1.44/containers/{id}/start`, `POST /v1.44/containers/{id}/stop`, `DELETE /v1.44/containers/{id}`.
 - Real-time logs: `GET /v1.44/containers/{id}/logs?follow=1&stdout=1&stderr=1`.
 - Interactive terminal: `POST /v1.44/containers/{id}/attach/ws` (WebSocket).
+- Remote file management: `GET /v1.44/containers/{id}/archive` and `PUT /v1.44/containers/{id}/archive` (tar streaming).
 
 ### 2.2 Security Hardening: `tecnativa/docker-socket-proxy`
 Exposing the raw Docker socket to any network interface—even over an authenticated private tunnel—presents extreme risk. A compromised API token could allow mounting the host root filesystem (`-v /:/host`) or executing privileged containers.
@@ -36,6 +37,8 @@ services:
       INFO: 1
       PING: 1
       VERSION: 1
+      POST: 1
+      DELETE: 1
       # Disable dangerous host manipulation
       VOLUMES: 0
       NETWORKS: 0
@@ -46,8 +49,6 @@ services:
       SECRETS: 0
       CONFIGS: 0
       PLUGINS: 0
-      POST: 1
-      DELETE: 1
       AUTH: 0
 ```
 
@@ -86,81 +87,82 @@ worker.addEventListener("close", () => serverSocket.close());
 return new Response(null, { status: 101, webSocket: client });
 ```
 
-### 2.4 Demultiplexing Docker Binary Log Streams
-Docker prefixes log frames with an 8-byte header:
-- `Byte 0`: Stream type (`1` = stdout, `2` = stderr).
-- `Bytes 1–3`: Reserved null bytes (`0x00, 0x00, 0x00`).
-- `Bytes 4–7`: Big-endian unsigned 32-bit integer indicating frame size.
-
-The Cloudflare Worker uses a `TransformStream` to demux stdout and stderr into JSON or SSE frames in real time without buffering the entire output.
+### 2.4 Web SFTP File Explorer (OmnySSH Pattern)
+Rather than relying solely on bash terminal commands to inspect container files, the Cloudflare Pages SPA incorporates the dual-pane file management design of [timhartmann7/omnyssh](https://github.com/timhartmann7/omnyssh):
+- The Worker queries `/containers/{id}/archive?path=/workspace` to extract directories and download files.
+- Operators can upload configuration files, assets, and dependencies directly into target sandboxes without restarting the container.
 
 ---
 
-## 3. Multi-Node Orchestration: HashiCorp Nomad vs. K3s
+## 3. Remote Context & Traffic Mirroring: `metalbear-co/mirrord`
 
-When managing multiple servers, a cluster scheduler is required.
+A major challenge when using remote self-hosted compute is local developer and AI agent ergonomics. Running tests or coding agents locally often requires access to the remote database, S3 storage, and internal microservices.
 
-| Feature | HashiCorp Nomad ([hashicorp/nomad](https://github.com/hashicorp/nomad)) | K3s / Kubernetes ([k3s-io/k3s](https://github.com/k3s-io/k3s)) |
-| :--- | :--- | :--- |
-| **API Philosophy** | Clean REST API with flat JSON payloads | Verbose declarative Kubernetes API with deep nesting |
-| **Auth Model** | Simple header: `X-Nomad-Token: <token>` | Bearer token / client certificates |
-| **Ad-Hoc / Batch Jobs** | **Parameterized Jobs** (`POST /v1/job/{id}/dispatch`) | Requires generating custom `Job`/`Pod` manifests per run |
-| **Footprint** | Single ~80MB Go binary; **40–80MB RAM idle** | Single binary, but runs apiserver/etcd; **500MB–1.2GB RAM** |
-| **Execution Drivers** | Docker, Podman, Firecracker, raw_exec, QEMU | OCI containers only (CRI) |
-| **CF Worker Ergonomics**| **Optimal**: Easy to dispatch and monitor via standard `fetch()` | High overhead for serverless edge workers |
+[metalbear-co/mirrord](https://github.com/metalbear-co/mirrord) bridges this gap:
 
-### Dispatching Parameterized Jobs in Nomad from Cloudflare Worker
-1. Define a template job in Nomad:
-   ```hcl
-   job "sandbox-task" {
-     type = "batch"
-     parameterized {
-       payload       = "forbidden"
-       meta_required = ["SANDBOX_ID", "IMAGE", "COMMAND"]
-     }
-     group "task" {
-       task "runner" {
-         driver = "docker"
-         config {
-           image   = "${NOMAD_META_IMAGE}"
-           command = "${NOMAD_META_COMMAND}"
-           runtime = "runsc" # gVisor sandboxing
-         }
-         resources {
-           cpu    = 2000
-           memory = 2048
-         }
-       }
-     }
-   }
-   ```
-2. The Cloudflare Worker triggers runs dynamically:
-   ```typescript
-   const res = await fetch(`${env.NOMAD_URL}/v1/job/sandbox-task/dispatch`, {
-     method: "POST",
-     headers: {
-       "Content-Type": "application/json",
-       "X-Nomad-Token": env.NOMAD_TOKEN,
-       "CF-Access-Client-Id": env.CF_ACCESS_CLIENT_ID,
-       "CF-Access-Client-Secret": env.CF_ACCESS_CLIENT_SECRET,
-     },
-     body: JSON.stringify({
-       Meta: {
-         SANDBOX_ID: "sandbox-9481",
-         IMAGE: "ghcr.io/org/ci-builder:latest",
-         COMMAND: "npm test",
-       },
-     }),
-   });
-   ```
+```
+┌──────────────────────────────────────┐          ┌──────────────────────────────────────┐
+│  LOCAL MACHINE / AI AGENT (Cursor)   │          │     REMOTE DATA PLANE (Hetzner)      │
+│                                      │          │                                      │
+│  [Local Process / Coding Agent]      │          │  [Target Sandbox Container]          │
+│    - mirrord layer (LD_PRELOAD)      │          │    - Real database connections       │
+│    - Hooks connect(), bind(), open() │          │    - Real Garage S3 / workerd mesh   │
+│              │                       │          │              │                       │
+└──────────────┼───────────────────────┘          └──────────────┼───────────────────────┘
+               │                                                 │
+               │ Encrypted Cloudflare Tunnel / mirrord session   │
+               └─────────────────────────────────────────────────┘
+```
+
+### Capabilities of mirrord in this Architecture:
+1. **Traffic Mirroring & Stealing**: Passively copies incoming HTTP/TCP requests from the remote container to the local agent, allowing real-time debugging without disrupting production or staging pipelines.
+2. **Remote DNS Resolution**: When the local process resolves `garage.internal` or `workerd.internal`, mirrord intercepts `getaddrinfo` and resolves the name using the remote host's private network stack.
+3. **Environment Injection**: Pulls environment variables and secrets dynamically from the remote sandbox into the local execution context.
+4. **File Operations**: Remote file reads (`open`, `read`) are piped over the tunnel, giving the local process seamless access to remote configuration files.
 
 ---
 
-## 4. In-Depth Analysis of `gofixpoint/amika`
+## 4. Userspace Sandboxing & Tunnel Fallback: `talaria0101/cfrs`
+
+In highly restricted sandboxes (e.g. nested unprivileged containers, minimal Alpine images, environments where UDP/QUIC or port 7844 is filtered), the standard 40MB Go `cloudflared` binary fails.
+
+[talaria0101/cfrs](https://github.com/talaria0101/cfrs) provides a lightweight Rust alternative:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                   RESTRICTED UNPRIVILEGED SANDBOX                      │
+│                                                                        │
+│  [Process / Service]                                                  │
+│    - Binds 10.66.0.2:8080 (No kernel AF_INET access)                   │
+│    - Interposed by libcfrsnet.so (LD_PRELOAD)                          │
+│         │                                                              │
+│         ▼ (Rewritten to abstract socket: \0cfrsnet/v4/10.66.0.2/8080)   │
+│  [cfrs net Userspace IP Stack (smoltcp)]                               │
+│    - Private 10.66.0.0/24 network in userspace                         │
+│    - Requires ZERO root, CAP_NET_ADMIN, or kernel network namespaces   │
+│         │                                                              │
+│         ▼                                                              │
+│  [cfrs quick-tunnel / serve]                                           │
+│    - Anonymous Cloudflare quick-tunnel via HTTP CONNECT proxy          │
+│    - Fallback: SSH remote forward on port 443 to external relay        │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │ Outbound HTTPS / SSH (Port 443)
+                                    ▼
+                      [ Public Web Preview URL ]
+```
+
+### Key Integrations of `cfrs`:
+1. **Userspace IP Stack without Root (`cfrs net`)**: Enables running complex networked services in unprivileged containers without requiring `--privileged` or `CAP_NET_ADMIN` Docker flags.
+2. **Anonymous Quick Tunnels**: Generates instant temporary public preview URLs (`POST /tunnel` via HTTP proxy) for ad-hoc container previews.
+3. **SSH Remote Forwarding Fallback (`cfrs serve`)**: When Cloudflare edge port 7844 is blocked by intermediate firewalls, carries tunnels over an SSH remote forward on port 443, splicing visitor connections to local Unix sockets.
+
+---
+
+## 5. In-Depth Analysis of `gofixpoint/amika`
 
 [gofixpoint/amika](https://github.com/gofixpoint/amika) provides a reference blueprint for orchestrating remote VMs and coding environments from Cloudflare edge services.
 
-### 4.1 Core Subsystems
+### 5.1 Core Subsystems
 1. **`go/cmd/amikad/` (In-Guest Daemon)**:
    - Runs inside the VM sandbox at `/usr/local/bin/amikad`.
    - Binds OpenSSH `sshd` strictly to `127.0.0.1:22` (loopback only).
@@ -180,13 +182,9 @@ When managing multiple servers, a cluster scheduler is required.
      - Host emits ping frame `amika.tunnel.v2.ping` every 30s.
      - Cloudflare Durable Object configures `setWebSocketAutoResponse`, allowing Cloudflare Edge to return `amika.tunnel.v2.pong` **without waking the Durable Object from sleep**, incurring zero execution cost.
 
-### 4.2 Repurposing Amika Components
-- Extract `@amika/tunnel-protocol` to serve as a high-density multiplexer between Cloudflare Durable Objects and remote compute agents.
-- Adopt the `amikad` loopback SSH bridge design for browser-based interactive terminal access to CI sandboxes.
-
 ---
 
-## 5. MicroVM & Sandbox Runtimes
+## 6. MicroVM & Sandbox Runtimes
 
 For untrusted multi-tenant workloads, raw Docker containers share the host Linux kernel. To achieve true virtualization:
 

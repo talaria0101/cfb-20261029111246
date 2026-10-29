@@ -14,6 +14,7 @@
       --accent: #f97316; /* Cloudflare orange */
       --accent-hover: #ea580c;
       --success: #22c55e;
+      --warning: #eab308;
       --danger: #ef4444;
       --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     }
@@ -42,6 +43,28 @@
       color: #000;
       padding: 2px 8px;
       border-radius: 9999px;
+      font-weight: 700;
+    }
+    nav {
+      display: flex;
+      gap: 12px;
+      margin-bottom: 24px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 12px;
+    }
+    nav button {
+      background: transparent;
+      color: var(--text-muted);
+      border: 1px solid var(--border);
+      padding: 6px 14px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-weight: 500;
+    }
+    nav button.active {
+      background: var(--accent);
+      color: #000;
+      border-color: var(--accent);
       font-weight: 700;
     }
     .grid {
@@ -88,7 +111,7 @@
       font-family: inherit;
       font-size: 0.9rem;
     }
-    button {
+    button.btn {
       margin-top: 12px;
       background: var(--accent);
       color: #000;
@@ -99,7 +122,7 @@
       cursor: pointer;
       transition: background 0.2s;
     }
-    button:hover { background: var(--accent-hover); }
+    button.btn:hover { background: var(--accent-hover); }
     .terminal-window {
       background: #050811;
       border: 1px solid var(--border);
@@ -125,60 +148,211 @@
       border-bottom: 1px solid var(--border);
     }
     th { color: var(--text-muted); font-weight: 500; }
+    
+    /* Topology Graph CSS (Homelable Pattern) */
+    .topology-container {
+      background: #090d16;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 24px;
+      min-height: 380px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+    .topo-layer {
+      display: flex;
+      justify-content: center;
+      gap: 20px;
+      flex-wrap: wrap;
+    }
+    .topo-node {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px 18px;
+      min-width: 180px;
+      text-align: center;
+      position: relative;
+    }
+    .topo-node.control { border-color: var(--accent); }
+    .topo-node.network { border-color: #38bdf8; }
+    .topo-node.host { border-color: #a855f7; }
+    .topo-node.service { border-color: var(--success); }
+    .topo-node.sandbox { border-color: #64748b; }
+    .topo-node-title { font-weight: 700; font-size: 0.9rem; }
+    .topo-node-meta { font-size: 0.75rem; color: var(--text-muted); }
   </style>
 </head>
 <body>
   <header>
     <h1>Cloudflare Alt Control Plane <span class="badge">Edge Managed</span></h1>
     <div style="font-size: 0.85rem; color: var(--text-muted);">
-      Host: Hetzner Node 01 &bull; Tunnel: <span style="color: var(--success); font-weight: 600;">ACTIVE (QUIC)</span>
+      Host: Hetzner Node 01 &bull; Tunnel: <span style="color: var(--success); font-weight: 600;">ACTIVE (QUIC / cfrs fallback)</span>
     </div>
   </header>
 
-  <!-- Service Status Metrics -->
-  <div class="grid">
-    <div class="card">
-      <h2>Compute / Containers <span class="status-indicator"></span></h2>
-      <p style="font-size: 0.85rem; color: var(--text-muted);">Engine: Docker + gVisor runsc via docker-socket-proxy</p>
-      <div style="margin-top: 12px; font-size: 1.5rem; font-weight: 700;" id="containerCount">--</div>
-      <div style="font-size: 0.8rem; color: var(--text-muted);">Active Sandboxes</div>
+  <nav>
+    <button class="active" onclick="switchTab('overview')">Infrastructure Overview</button>
+    <button onclick="switchTab('topology')">Topology Visualizer (Homelable)</button>
+    <button onclick="switchTab('compute')">Sandboxes & Web SFTP (OmnySSH)</button>
+    <button onclick="switchTab('ci')">Heavy CI & Logs (Woodpecker)</button>
+    <button onclick="switchTab('storage')">Garage S3 Storage</button>
+  </nav>
+
+  <!-- TAB 1: OVERVIEW -->
+  <div id="tab-overview">
+    <!-- Service Status Metrics (ServerBee Pattern) -->
+    <div class="grid">
+      <div class="card">
+        <h2>Compute / Sandboxes <span class="status-indicator"></span></h2>
+        <p style="font-size: 0.85rem; color: var(--text-muted);">Engine: Docker + gVisor runsc via proxy</p>
+        <div style="margin-top: 12px; font-size: 1.5rem; font-weight: 700;" id="containerCount">--</div>
+        <div style="font-size: 0.8rem; color: var(--text-muted);">Active Sandboxes</div>
+      </div>
+      <div class="card">
+        <h2>Storage Plane (R2 Alt) <span class="status-indicator"></span></h2>
+        <p style="font-size: 0.85rem; color: var(--text-muted);">Engine: Garage S3 (Rust Dynamo CRDT)</p>
+        <div style="margin-top: 12px; font-size: 1.5rem; font-weight: 700;">OK</div>
+        <div style="font-size: 0.8rem; color: var(--text-muted);">Direct Presigning: Active</div>
+      </div>
+      <div class="card">
+        <h2>Workers & DO Runtime <span class="status-indicator"></span></h2>
+        <p style="font-size: 0.85rem; color: var(--text-muted);">Engine: cloudflare/workerd standalone</p>
+        <div style="margin-top: 12px; font-size: 1.5rem; font-weight: 700;">Active</div>
+        <div style="font-size: 0.8rem; color: var(--text-muted);">SQLite DOs & Hibernated Sockets</div>
+      </div>
+      <div class="card">
+        <h2>Heavy CI Engine <span class="status-indicator"></span></h2>
+        <p style="font-size: 0.85rem; color: var(--text-muted);">Engine: Woodpecker CI Server + Agents</p>
+        <div style="margin-top: 12px; font-size: 1.5rem; font-weight: 700;">4 Slots</div>
+        <div style="font-size: 0.8rem; color: var(--text-muted);">DinD Build Capacity</div>
+      </div>
     </div>
-    <div class="card">
-      <h2>Storage Plane (R2 Alt) <span class="status-indicator"></span></h2>
-      <p style="font-size: 0.85rem; color: var(--text-muted);">Engine: Garage S3 (Rust Dynamo CRDT)</p>
-      <div style="margin-top: 12px; font-size: 1.5rem; font-weight: 700;">OK</div>
-      <div style="font-size: 0.8rem; color: var(--text-muted);">Egress Presigning: Active</div>
-    </div>
-    <div class="card">
-      <h2>Workers & DO Runtime <span class="status-indicator"></span></h2>
-      <p style="font-size: 0.85rem; color: var(--text-muted);">Engine: cloudflare/workerd standalone</p>
-      <div style="margin-top: 12px; font-size: 1.5rem; font-weight: 700;">Active</div>
-      <div style="font-size: 0.8rem; color: var(--text-muted);">SQLite DOs & Hibernated Sockets</div>
-    </div>
-    <div class="card">
-      <h2>Heavy CI Runner <span class="status-indicator"></span></h2>
-      <p style="font-size: 0.85rem; color: var(--text-muted);">Engine: Woodpecker CI Server + Agents</p>
-      <div style="margin-top: 12px; font-size: 1.5rem; font-weight: 700;">4 Slots</div>
-      <div style="font-size: 0.8rem; color: var(--text-muted);">DinD Build Capacity</div>
+
+    <!-- Active Containers Table -->
+    <div class="card" style="margin-bottom: 24px;">
+      <h2>Active Container Sandboxes</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Container ID</th>
+            <th>Image</th>
+            <th>Command</th>
+            <th>Status</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="containerTableBody">
+          <tr><td colspan="5" style="color: var(--text-muted);">Loading containers...</td></tr>
+        </tbody>
+      </table>
     </div>
   </div>
 
-  <div class="grid">
-    <!-- 1. Provision Sandboxes -->
+  <!-- TAB 2: TOPOLOGY VISUALIZER (Homelable Pattern) -->
+  <div id="tab-topology" style="display: none;">
     <div class="card">
-      <h2>Provision Container Sandbox</h2>
-      <form id="spawnForm">
-        <label>Container Image</label>
-        <input type="text" id="spawnImage" value="alpine:latest" placeholder="e.g. node:20-alpine">
-        <label>Startup Command (JSON Array)</label>
-        <input type="text" id="spawnCmd" value='["/bin/sh", "-c", "sleep 3600"]'>
-        <label>Memory Limit (MB)</label>
-        <input type="number" id="spawnMem" value="512">
-        <button type="submit">Spawn Sandbox</button>
-      </form>
+      <h2>Infrastructure Topology (Edge to Host Mesh)</h2>
+      <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 16px;">
+        Live visual representation of Cloudflare Edge routing through encrypted tunnels into host compute, storage, and container nodes.
+      </p>
+      <div class="topology-container" id="topoGraph">
+        <!-- Layer 1: Edge Control Plane -->
+        <div class="topo-layer">
+          <div class="topo-node control">
+            <div class="topo-node-title">Cloudflare Edge</div>
+            <div class="topo-node-meta">Pages SPA &bull; Worker API &bull; D1</div>
+          </div>
+        </div>
+        <div style="text-align: center; color: var(--accent);">&darr; Outbound Encrypted QUIC / HTTP3 &darr;</div>
+        <!-- Layer 2: Tunnel Ingress -->
+        <div class="topo-layer">
+          <div class="topo-node network">
+            <div class="topo-node-title">Cloudflare Tunnel</div>
+            <div class="topo-node-meta">cloudflared / cfrs fallback</div>
+          </div>
+        </div>
+        <div style="text-align: center; color: #38bdf8;">&darr; Local Mesh (Hetzner Node 01) &darr;</div>
+        <!-- Layer 3: Services & Storage -->
+        <div class="topo-layer">
+          <div class="topo-node service">
+            <div class="topo-node-title">Docker Engine</div>
+            <div class="topo-node-meta">tecnativa proxy &bull; gVisor</div>
+          </div>
+          <div class="topo-node service">
+            <div class="topo-node-title">Garage S3</div>
+            <div class="topo-node-meta">Port 3900 &bull; CRDT Sync</div>
+          </div>
+          <div class="topo-node service">
+            <div class="topo-node-title">workerd Runtime</div>
+            <div class="topo-node-meta">SQLite DOs &bull; V8 Isolates</div>
+          </div>
+          <div class="topo-node service">
+            <div class="topo-node-title">Woodpecker CI</div>
+            <div class="topo-node-meta">DinD Agents &bull; SSE Streams</div>
+          </div>
+        </div>
+        <div style="text-align: center; color: var(--success);">&darr; Sandboxed Ephemeral Workloads &darr;</div>
+        <!-- Layer 4: Sandboxes -->
+        <div class="topo-layer" id="topoSandboxes">
+          <div class="topo-node sandbox">
+            <div class="topo-node-title">CI Builder</div>
+            <div class="topo-node-meta">ephemeral container</div>
+          </div>
+          <div class="topo-node sandbox">
+            <div class="topo-node-title">Coding Agent Rig</div>
+            <div class="topo-node-meta">Amika / mirrord session</div>
+          </div>
+        </div>
+      </div>
     </div>
+  </div>
 
-    <!-- 2. Direct S3 Upload via Presigned URL -->
+  <!-- TAB 3: COMPUTE & WEB SFTP (OmnySSH Pattern) -->
+  <div id="tab-compute" style="display: none;">
+    <div class="grid">
+      <div class="card">
+        <h2>Provision Sandbox</h2>
+        <form id="spawnForm">
+          <label>Container Image</label>
+          <input type="text" id="spawnImage" value="alpine:latest" placeholder="e.g. node:20-alpine">
+          <label>Startup Command (JSON Array)</label>
+          <input type="text" id="spawnCmd" value='["/bin/sh", "-c", "sleep 3600"]'>
+          <label>Memory Limit (MB)</label>
+          <input type="number" id="spawnMem" value="512">
+          <button type="submit" class="btn">Spawn Sandbox</button>
+        </form>
+      </div>
+
+      <div class="card">
+        <h2>Web SFTP File Explorer (OmnySSH Pattern)</h2>
+        <label>Target Container ID</label>
+        <input type="text" id="sftpContainerId" placeholder="Container ID">
+        <label>Path to Browse / Download</label>
+        <input type="text" id="sftpPath" value="/workspace">
+        <button type="button" class="btn" onclick="fetchContainerFile()">Download Container Archive</button>
+        <div id="sftpStatus" style="font-size: 0.8rem; margin-top: 8px; color: var(--text-muted);"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- TAB 4: CI & LOGS -->
+  <div id="tab-ci" style="display: none;">
+    <div class="card">
+      <h2>Heavy CI Live Stream (Woodpecker SSE Proxy)</h2>
+      <div style="display: flex; gap: 12px; margin-top: 8px;">
+        <input type="text" id="ciRepoId" placeholder="Repo ID" value="1" style="max-width: 150px;">
+        <input type="text" id="ciPipeline" placeholder="Pipeline" value="1" style="max-width: 150px;">
+        <input type="text" id="ciStep" placeholder="Step ID" value="2" style="max-width: 150px;">
+        <button id="ciConnectBtn" class="btn" style="margin-top: 0;">Connect Live Log Stream</button>
+      </div>
+      <div class="terminal-window" id="ciLogs">Logs will appear here once connected to SSE stream...</div>
+    </div>
+  </div>
+
+  <!-- TAB 5: STORAGE -->
+  <div id="tab-storage" style="display: none;">
     <div class="card">
       <h2>Garage S3 Direct Upload</h2>
       <form id="s3Form">
@@ -188,51 +362,28 @@
         <input type="text" id="s3Key" value="builds/output.tar.gz">
         <label>Select File</label>
         <input type="file" id="s3File">
-        <button type="submit">Upload Directly to Node S3</button>
+        <button type="submit" class="btn">Upload Directly to Node S3</button>
       </form>
       <div id="s3Status" style="font-size: 0.8rem; margin-top: 8px; color: var(--text-muted);"></div>
     </div>
   </div>
 
-  <!-- Live Containers Table -->
-  <div class="card" style="margin-bottom: 24px;">
-    <h2>Active Container Sandboxes</h2>
-    <table>
-      <thead>
-        <tr>
-          <th>Container ID</th>
-          <th>Image</th>
-          <th>Command</th>
-          <th>Status</th>
-          <th>Actions</th>
-        </tr>
-      </thead>
-      <tbody id="containerTableBody">
-        <tr><td colspan="5" style="color: var(--text-muted);">Loading containers...</td></tr>
-      </tbody>
-    </table>
-  </div>
-
-  <!-- Heavy CI Live Log Viewer (SSE) -->
-  <div class="card">
-    <h2>Heavy CI Live Stream (Woodpecker SSE Proxy)</h2>
-    <div style="display: flex; gap: 12px; margin-top: 8px;">
-      <input type="text" id="ciRepoId" placeholder="Repo ID (e.g. 1)" value="1" style="max-width: 150px;">
-      <input type="text" id="ciPipeline" placeholder="Pipeline (e.g. 1)" value="1" style="max-width: 150px;">
-      <input type="text" id="ciStep" placeholder="Step ID (e.g. 2)" value="2" style="max-width: 150px;">
-      <button id="ciConnectBtn">Connect Live Log Stream</button>
-    </div>
-    <div class="terminal-window" id="ciLogs">Logs will appear here once connected to SSE stream...</div>
-  </div>
-
   <script>
     const API_BASE = window.location.origin;
 
-    // Load active containers
+    function switchTab(tabId) {
+      document.querySelectorAll("nav button").forEach(b => b.classList.remove("active"));
+      event.target.classList.add("active");
+      ["overview", "topology", "compute", "ci", "storage"].forEach(id => {
+        document.getElementById(`tab-${id}`).style.display = (id === tabId) ? "block" : "none";
+      });
+      if (tabId === "topology") loadTopology();
+    }
+
     async function loadContainers() {
       try {
         const res = await fetch(`${API_BASE}/api/sandboxes/list`);
-        if (!res.ok) throw new Error("Failed to load containers");
+        if (!res.ok) throw new Error("Failed to load");
         const containers = await res.json();
         
         document.getElementById("containerCount").textContent = containers.length;
@@ -251,7 +402,7 @@
             <td>${c.Image}</td>
             <td><code>${c.Command}</code></td>
             <td><span style="color: var(--success);">${c.Status}</span></td>
-            <td><button style="margin: 0; padding: 4px 8px; font-size: 0.75rem;" onclick="connectTerminal('${c.Id}')">Attach Terminal</button></td>
+            <td><button class="btn" style="margin: 0; padding: 4px 8px; font-size: 0.75rem;" onclick="connectTerminal('${c.Id}')">Attach Terminal</button></td>
           `;
           tbody.appendChild(tr);
         });
@@ -260,67 +411,28 @@
       }
     }
 
-    // Spawn container
-    document.getElementById("spawnForm").addEventListener("submit", async (e) => {
-      e.preventDefault();
-      const image = document.getElementById("spawnImage").value;
-      const cmd = JSON.parse(document.getElementById("spawnCmd").value);
-      const memLimitMb = parseInt(document.getElementById("spawnMem").value, 10);
+    async function loadTopology() {
+      try {
+        const res = await fetch(`${API_BASE}/api/topology`);
+        if (!res.ok) return;
+        const topo = await res.json();
+        const sandboxesLayer = document.getElementById("topoSandboxes");
+        sandboxesLayer.innerHTML = "";
+        topo.nodes.filter(n => n.type === "sandbox").forEach(s => {
+          const div = document.createElement("div");
+          div.className = "topo-node sandbox";
+          div.innerHTML = `<div class="topo-node-title">${s.label}</div><div class="topo-node-meta">${s.status}</div>`;
+          sandboxesLayer.appendChild(div);
+        });
+      } catch (_) {}
+    }
 
-      const res = await fetch(`${API_BASE}/api/sandboxes/spawn`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ image, cmd, memLimitMb })
-      });
-
-      if (res.ok) {
-        alert("Container spawned successfully!");
-        loadContainers();
-      } else {
-        alert("Spawn failed: " + await res.text());
-      }
-    });
-
-    // Direct S3 Upload via Presigned URL
-    document.getElementById("s3Form").addEventListener("submit", async (e) => {
-      e.preventDefault();
-      const bucket = document.getElementById("s3Bucket").value;
-      const key = document.getElementById("s3Key").value;
-      const file = document.getElementById("s3File").files[0];
-      const statusDiv = document.getElementById("s3Status");
-
-      if (!file) {
-        alert("Please select a file to upload");
-        return;
-      }
-
-      statusDiv.textContent = "Requesting presigned upload URL from Cloudflare Worker...";
-      const presignRes = await fetch(`${API_BASE}/api/storage/presign`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ bucket, key, operation: "put", contentType: file.type })
-      });
-
-      if (!presignRes.ok) {
-        statusDiv.textContent = "Presign failed!";
-        return;
-      }
-
-      const { presignedUrl } = await presignRes.json();
-      statusDiv.textContent = "Uploading directly to Garage S3 over Cloudflare Tunnel...";
-
-      const uploadRes = await fetch(presignedUrl, {
-        method: "PUT",
-        headers: { "Content-Type": file.type },
-        body: file
-      });
-
-      if (uploadRes.ok) {
-        statusDiv.textContent = "Upload completed successfully! (Zero edge memory used)";
-      } else {
-        statusDiv.textContent = "Upload failed: " + uploadRes.statusText;
-      }
-    });
+    function fetchContainerFile() {
+      const containerId = document.getElementById("sftpContainerId").value.trim();
+      const path = document.getElementById("sftpPath").value.trim();
+      if (!containerId) { alert("Enter Container ID"); return; }
+      window.open(`${API_BASE}/api/sandboxes/files/${containerId}?path=${encodeURIComponent(path)}`, "_blank");
+    }
 
     // Connect to Woodpecker SSE Log Stream
     document.getElementById("ciConnectBtn").addEventListener("click", () => {

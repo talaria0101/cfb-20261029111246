@@ -38,5 +38,12 @@ ingress:
       disableChunkedEncoding: false
       noTLSVerify: true
 
+  # 5. ServerBee Host Telemetry Probe (WebSocket & REST) (Port 9527)
+  - hostname: telemetry.${BASE_DOMAIN}
+    service: http://serverbee-agent:9527
+    originRequest:
+      connectTimeout: 15s
+      noTLSVerify: true
+
   # Default Catch-All
   - service: http_status:404

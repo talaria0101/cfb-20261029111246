@@ -1,6 +1,7 @@
 /**
  * Cloudflare Worker Edge Control Plane
- * Orchestrates remote compute, storage, and CI over Cloudflare Tunnels
+ * Orchestrates remote compute, storage, CI, and telemetry over Cloudflare Tunnels
+ * Incorporates patterns from Amika, workerd, Garage, Woodpecker, ServerBee, Homelable, OmnySSH, mirrord, and cfrs.
  * License: 0BSD
  */
 
@@ -13,6 +14,7 @@ export interface Env {
   STORAGE_TUNNEL_HOST: string;
   WORKERD_TUNNEL_HOST: string;
   CI_TUNNEL_HOST: string;
+  TELEMETRY_TUNNEL_HOST?: string;
 
   // Cloudflare Access Service Token credentials
   CF_ACCESS_CLIENT_ID: string;
@@ -45,7 +47,14 @@ export default {
 
     try {
       // ────────────────────────────────────────────────────────────────────────
-      // 1. Compute & Sandbox Management (Docker Socket Proxy over Tunnel)
+      // 1. Topology & Infrastructure Graph (Homelable Pattern)
+      // ────────────────────────────────────────────────────────────────────────
+      if (url.pathname === "/api/topology" && request.method === "GET") {
+        return await handleTopologyGraph(env);
+      }
+
+      // ────────────────────────────────────────────────────────────────────────
+      // 2. Compute & Sandbox Management (Docker Socket Proxy over Tunnel)
       // ────────────────────────────────────────────────────────────────────────
       if (url.pathname === "/api/sandboxes/list" && request.method === "GET") {
         return await proxyDocker(env, "/v1.44/containers/json?all=1", "GET");
@@ -124,8 +133,23 @@ export default {
         return new Response(null, { status: 101, webSocket: client });
       }
 
+      // Web SFTP / Remote File Explorer (OmnySSH Pattern)
+      if (url.pathname.startsWith("/api/sandboxes/files/")) {
+        const parts = url.pathname.split("/");
+        const containerId = parts[4];
+        const filePath = url.searchParams.get("path") || "/workspace";
+
+        if (request.method === "GET") {
+          // Download or stream archive from container
+          const targetUrl = `${env.DOCKER_TUNNEL_HOST}/v1.44/containers/${containerId}/archive?path=${encodeURIComponent(filePath)}`;
+          return await fetch(targetUrl, {
+            headers: getTunnelHeaders(env),
+          });
+        }
+      }
+
       // ────────────────────────────────────────────────────────────────────────
-      // 2. Storage Plane: Presigned URLs for Garage S3
+      // 3. Storage Plane: Presigned URLs for Garage S3
       // ────────────────────────────────────────────────────────────────────────
       if (url.pathname === "/api/storage/presign" && request.method === "POST") {
         const { bucket, key, operation, contentType } = await request.json<{
@@ -164,7 +188,7 @@ export default {
       }
 
       // ────────────────────────────────────────────────────────────────────────
-      // 3. Heavy CI: Webhook Ingress & Live SSE Log Proxy
+      // 4. Heavy CI: Webhook Ingress & Live SSE Log Proxy
       // ────────────────────────────────────────────────────────────────────────
       if (url.pathname === "/webhook/github" && request.method === "POST") {
         return await handleGitHubWebhook(request, env);
@@ -203,7 +227,7 @@ export default {
       }
 
       // ────────────────────────────────────────────────────────────────────────
-      // 4. workerd Runtime & Durable Objects Gateway Proxy
+      // 5. workerd Runtime & Durable Objects Gateway Proxy
       // ────────────────────────────────────────────────────────────────────────
       if (url.pathname.startsWith("/api/workerd/")) {
         const subPath = url.pathname.replace("/api/workerd", "");
@@ -250,6 +274,52 @@ async function proxyDocker(env: Env, path: string, method: string): Promise<Resp
       "Access-Control-Allow-Origin": "*",
     },
   });
+}
+
+// Builds Homelable-style topology graph data structure
+async function handleTopologyGraph(env: Env): Promise<Response> {
+  let containers: any[] = [];
+  try {
+    const res = await fetch(`${env.DOCKER_TUNNEL_HOST}/v1.44/containers/json?all=1`, {
+      headers: getTunnelHeaders(env),
+    });
+    if (res.ok) {
+      containers = await res.json();
+    }
+  } catch (_) {}
+
+  const nodes = [
+    { id: "cf-edge", label: "Cloudflare Edge (Workers/Pages)", type: "control-plane", status: "online" },
+    { id: "cf-tunnel", label: "Cloudflare Tunnel (cloudflared/cfrs)", type: "network", status: "online" },
+    { id: "host-node1", label: "Host Server (Hetzner Node 01)", type: "host", status: "online" },
+    { id: "svc-docker", label: "Docker Engine / gVisor", type: "runtime", status: "online" },
+    { id: "svc-garage", label: "Garage S3 Object Store", type: "storage", status: "online" },
+    { id: "svc-workerd", label: "workerd Standalone Runtime", type: "runtime", status: "online" },
+    { id: "svc-ci", label: "Woodpecker CI Engine", type: "ci", status: "online" },
+  ];
+
+  const edges = [
+    { from: "cf-edge", to: "cf-tunnel", protocol: "QUIC/HTTP3" },
+    { from: "cf-tunnel", to: "host-node1", protocol: "mTLS/Tunnel" },
+    { from: "host-node1", to: "svc-docker" },
+    { from: "host-node1", to: "svc-garage" },
+    { from: "host-node1", to: "svc-workerd" },
+    { from: "host-node1", to: "svc-ci" },
+  ];
+
+  // Append dynamic container nodes
+  containers.forEach((c) => {
+    const cId = `container-${c.Id.substring(0, 12)}`;
+    nodes.push({
+      id: cId,
+      label: `${c.Names?.[0] || c.Id.substring(0, 8)} (${c.Image})`,
+      type: "sandbox",
+      status: c.State === "running" ? "online" : "stopped",
+    });
+    edges.push({ from: "svc-docker", to: cId });
+  });
+
+  return Response.json({ nodes, edges, generatedAt: new Date().toISOString() });
 }
 
 async function handleGitHubWebhook(request: Request, env: Env): Promise<Response> {

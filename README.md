@@ -20,6 +20,7 @@ Cloudflare's serverless edge provides global low-latency routing, DDoS mitigatio
 - **Management Plane**: Hosted on **Cloudflare Pages (SPA)** + **Cloudflare Workers (API Gateway)** + **D1 / KV**.
 - **Data & Compute Plane**: Self-hosted on bare-metal servers (Hetzner, OVH), home labs, or spot VPS.
 - **Secure Networking**: Connected via **Cloudflare Tunnels (`cloudflared`)** with **Cloudflare Access Service Tokens**. Zero open inbound firewall ports.
+- **Restricted Sandbox Fallback**: Powered by **`talaria0101/cfrs`** for userspace networking and quick tunnels where `cloudflared` cannot run.
 
 ---
 
@@ -27,12 +28,12 @@ Cloudflare's serverless edge provides global low-latency routing, DDoS mitigatio
 
 | Document | Description |
 | :--- | :--- |
-| **[`spec/01-architecture-overview.md`](spec/01-architecture-overview.md)** | End-to-end system design, push vs. pull communication models, and threat model. |
-| **[`spec/02-compute-sandbox-orchestration.md`](spec/02-compute-sandbox-orchestration.md)** | Docker API over tunnel, `docker-socket-proxy`, Nomad batch jobs, and `gofixpoint/amika`. |
+| **[`spec/01-architecture-overview.md`](spec/01-architecture-overview.md)** | End-to-end system design, push vs. pull vs. mirrored models, and threat model. |
+| **[`spec/02-compute-sandbox-orchestration.md`](spec/02-compute-sandbox-orchestration.md)** | Docker API, Nomad, Amika analysis, mirrord context mirroring, and cfrs userspace VNet. |
 | **[`spec/03-self-hosting-workerd-and-workers.md`](spec/03-self-hosting-workerd-and-workers.md)** | Standalone `cloudflare/workerd`, Cap'n Proto config, SQLite Durable Objects, and `workerLoader`. |
 | **[`spec/04-storage-r2-and-durable-objects.md`](spec/04-storage-r2-and-durable-objects.md)** | Garage S3 vs SeaweedFS, edge-assisted S3 presigning, and distributed SQLite (`libSQL`). |
 | **[`spec/05-heavy-ci-runner-system.md`](spec/05-heavy-ci-runner-system.md)** | Woodpecker CI engine, edge webhook HMAC verification, and zero-buffering SSE log proxy. |
-| **[`spec/06-github-tools-critique.md`](spec/06-github-tools-critique.md)** | Exhaustive technical evaluation of GitHub prior art, strengths, failure modes, and trade-offs. |
+| **[`spec/06-github-tools-critique.md`](spec/06-github-tools-critique.md)** | Technical evaluation of 17 GitHub projects including Amika, mirrord, cfrs, ServerBee, Homelable, OmnySSH. |
 
 ---
 
@@ -55,29 +56,35 @@ Cloudflare's serverless edge provides global low-latency routing, DDoS mitigatio
 │                                   CLOUDFLARE EDGE CONTROL PLANE                                   │
 │                                                                                                   │
 │  [Cloudflare Pages: Single-Page Dashboard]                                                        │
-│    - Responsive React/Vite/Preact UI for node health, container lifecycle, and build logs.       │
+│    - Topology Visualizer: Interactive network and container graph (Homelable pattern).            │
+│    - Multi-Server Manager: Aggregated status, uptime tracking, and service bookmarks (CoreObs).  │
+│    - Web SFTP & Terminal: Dual-pane remote file browser and tabbed shell (OmnySSH pattern).       │
+│    - Live Telemetry Viewer: Real-time CPU, RAM, network, and process stream (ServerBee pattern).  │
 │                                                                                                   │
 │  [Cloudflare Worker: API Gateway & Router]                                                        │
 │    - Authentication: Cloudflare Zero Trust Access JWT validation & RBAC.                          │
 │    - Secret Store: Environment bindings for Cloudflare Access Service Tokens.                    │
-│    - Webhook Dispatcher: Verifies HMAC-SHA256 signatures; routes pipeline triggers.               │
-│    - S3 Presigner: Generates presigned URLs for direct browser-to-node storage uploads.           │
+│    - Webhook Dispatcher: Verifies HMAC-SHA256 signatures; routes pipeline triggers to CI.         │
+│    - S3 Presigner: Generates AWS SigV4 presigned URLs for direct browser-to-node storage uploads. │
 │    - SSE Log Streamer: Passes through real-time build logs with zero edge buffering.              │
+│    - Snippets Runner: Executes parameterized operational scripts stored in Cloudflare KV.         │
 │                                                                                                   │
 │  [Cloudflare Durable Objects: State Hub & Tunnel Multiplexer]                                     │
-│    - Optional persistent multiplexing hub (implementing @amika/tunnel-protocol v2).               │
+│    - Persistent multiplexing hub (implementing @amika/tunnel-protocol v2).                       │
 │    - Maintains persistent connection state using WebSocket Hibernation API (zero idle CPU cost). │
+│    - Telemetry aggregator piping ServerBee probe metrics to active dashboard clients.             │
 └─────────────────────────────────────────────────┬─────────────────────────────────────────────────┘
                                                   │
                                                   │ Cloudflare Tunnel (QUIC / HTTP/2 Transport)
+                                                  │ Fallback: cfrs quick-tunnel over SSH/CONNECT
                                                   │ Authenticated via CF-Access-Client-Id / Secret
                                                   ▼
 ┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
 │                                  REMOTE DATA PLANE (HOST MACHINE)                                 │
 │                                                                                                   │
-│  [cloudflared daemon]                                                                             │
-│    - Establishes persistent outbound-only encrypted tunnel to Cloudflare Edge.                    │
-│    - Terminates tunnel routes and proxies to internal loopback / container ports.                │
+│  [Tunnel Ingress: cloudflared / cfrs]                                                             │
+│    - cloudflared: Outbound encrypted QUIC tunnel to Cloudflare Edge.                              │
+│    - cfrs (Fallback): Rust quick-tunnel + userspace networking for restricted sandboxes.          │
 │                                                                                                   │
 │  ┌───────────────────────────────┬───────────────────────────────┬─────────────────────────────┐  │
 │  │     CONTAINER & COMPUTE       │        STORAGE PLANE          │     WORKERS & RUNTIMES      │  │
@@ -87,8 +94,11 @@ Cloudflare's serverless edge provides global low-latency routing, DDoS mitigatio
 │  │ • HashiCorp Nomad             │   - WAN-tolerant CRDT         │   - Persistent SQLite DOs   │  │
 │  │ • Sandboxes: gVisor (runsc)   │   - 50MB RAM footprint        │   - Hibernated WebSockets   │  │
 │  │ • Amika Agent / hostd         │ • SeaweedFS / libSQL          │   - workerLoader hot-reload │  │
+│  │ • mirrord Agent: traffic &    │ • Remote File Bridge: Web     │ • Embedded SQL API          │  │
+│  │   env mirroring to local dev  │   SFTP service (OmnySSH)      │   (state.storage.sql)       │  │
 │  ├───────────────────────────────┴───────────────────────────────┴─────────────────────────────┤  │
-│  │                                   HEAVY CI & RUNNER ENGINE                                  │  │
+│  │                        OBSERVABILITY, TELEMETRY & RUNNER ENGINES                            │  │
+│  │ • ServerBee Agent: 10MB Rust probe streaming CPU, RAM, disk, and process trees over WS     │  │
 │  │ • Woodpecker CI Server (REST / Webhook / SSE)                                               │  │
 │  │ • Woodpecker Agents (Docker-in-Docker, multi-stage builders, local pipelines)               │  │
 │  └─────────────────────────────────────────────────────────────────────────────────────────────┘  │
@@ -110,13 +120,19 @@ Cloudflare's serverless edge provides global low-latency routing, DDoS mitigatio
 - By setting `durableObjectStorage = (localDisk = "diskService")` and `enableSql = true`, `workerd` automatically backs every Durable Object instance with an **embedded SQLite database on disk**, granting relational SQL query execution (`state.storage.sql.exec`).
 - Supports **hibernatable WebSockets** (`state.acceptWebSocket()`), dropping memory consumption to near zero during idle connection states.
 
-### 3. Edge-Assisted S3 Presigning for Garage S3
-- To prevent Worker memory exhaustion (128 MB limit) when handling large build artifacts, the Cloudflare Worker issues AWS SigV4 presigned upload and download URLs.
-- The client streams large payloads directly to Garage S3 over the Cloudflare Tunnel, bypassing Worker CPU/memory entirely.
+### 3. Remote Context & Traffic Mirroring (`metalbear-co/mirrord`)
+- Solves remote developer and AI coding agent ergonomics.
+- Through dynamic linker interposition (`LD_PRELOAD`), local processes or Cursor/Claude Code agents run on developer machines as if they were physically inside the remote container on Hetzner, accessing the remote database, S3 storage, and internal DNS over Cloudflare Tunnel.
 
-### 4. Zero-Buffering SSE Live Build Logs
-- Woodpecker CI emits real-time build logs via Server-Sent Events (`/api/stream/logs/{repo}/{pipeline}/{step}`).
-- The Cloudflare Worker pipes the upstream `ReadableStream` directly to the client with `Cache-Control: no-transform` and `X-Accel-Buffering: no`, providing live terminal feeds to the browser dashboard.
+### 4. Userspace Virtual Networking & Sandbox Fallback (`talaria0101/cfrs`)
+- Provides a lightweight (~8MB) Rust Cloudflare quick-tunnel client and userspace virtual networking stack for locked-down container environments.
+- Implements `cfrs net`: an `LD_PRELOAD` shim (`libcfrsnet.so`) that maps `AF_INET` socket calls to `AF_UNIX` abstract sockets, and an in-process `smoltcp` stack that creates a private `10.66.0.0/24` network without root or `CAP_NET_ADMIN`.
+- Slices incoming traffic over port 443 SSH remote forwarding when Cloudflare edge port 7844 is filtered.
+
+### 5. Topology Visualization & Telemetry (`Pouzor/homelable`, `ServerBee`, `crocofied/CoreObs`)
+- The Cloudflare Pages SPA renders an interactive infrastructure graph showing Edge POPs, Tunnels, Host servers, and Sandboxes.
+- Ultra-lightweight Rust telemetry agent (`serverbee-agent`) streams CPU, RAM, disk, and process trees over WebSockets into the control plane using only 10 to 15 MiB of RAM.
+- Web SFTP file explorer and snippet automation adapted from `timhartmann7/omnyssh`.
 
 ---
 

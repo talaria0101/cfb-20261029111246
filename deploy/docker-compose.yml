@@ -125,3 +125,20 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - infra-mesh
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 7. ServerBee Agent (Lightweight Rust Host & Process Telemetry Probe)
+  # ───────────────────────────────────────────────────────────────────────────
+  serverbee-agent:
+    image: zingerlittlebee/serverbee-web:latest
+    container_name: serverbee-agent
+    restart: unless-stopped
+    environment:
+      - PORT=9527
+      - TOKEN=${SERVERBEE_TOKEN:-serverbee_secure_token}
+    volumes:
+      - /proc:/proc:ro
+      - /sys:/sys:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - infra-mesh
