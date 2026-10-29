@@ -1,0 +1,13 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cfb-control-plane",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-01-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "DOCKER_TUNNEL_HOST": "https://docker.infra.example.com",
+    "STORAGE_TUNNEL_HOST": "https://storage.infra.example.com",
+    "WORKERD_TUNNEL_HOST": "https://workerd.infra.example.com",
+    "CI_TUNNEL_HOST": "https://ci.infra.example.com"
+  }
+}

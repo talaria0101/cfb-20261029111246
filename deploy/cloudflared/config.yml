@@ -1,0 +1,42 @@
+# Cloudflare Tunnel Configuration
+# Tunnel routing inbound traffic from Cloudflare Edge to local containers
+
+tunnel: ${TUNNEL_ID}
+credentials-file: /etc/cloudflared/${TUNNEL_ID}.json
+
+# Transport protocol over QUIC / HTTP/3
+protocol: quic
+
+ingress:
+  # 1. Hardened Docker Socket Proxy (Port 2375)
+  - hostname: docker.${BASE_DOMAIN}
+    service: http://docker-proxy:2375
+    originRequest:
+      connectTimeout: 15s
+      noTLSVerify: true
+
+  # 2. Garage S3 Object Storage API (Port 3900)
+  - hostname: storage.${BASE_DOMAIN}
+    service: http://garage:3900
+    originRequest:
+      connectTimeout: 30s
+      noTLSVerify: true
+
+  # 3. workerd Runtime & Durable Objects Gateway (Port 8080)
+  - hostname: workerd.${BASE_DOMAIN}
+    service: http://workerd:8080
+    originRequest:
+      connectTimeout: 15s
+      noTLSVerify: true
+
+  # 4. Woodpecker CI Server (REST API, Webhook, SSE) (Port 8000)
+  - hostname: ci.${BASE_DOMAIN}
+    service: http://woodpecker-server:8000
+    originRequest:
+      connectTimeout: 30s
+      keepAliveTimeout: 120s
+      disableChunkedEncoding: false
+      noTLSVerify: true
+
+  # Default Catch-All
+  - service: http_status:404
